@@ -1,0 +1,9 @@
+{
+  "server": "http://controller.example:7878",
+  "name": "workbox",
+  "projects": { "myapp": "~/github/myapp" },
+  "resources": { "slots": 3, "gpu": 1 },
+  "features": ["zfs"],
+  "max_load": 0.9,
+  "update": "git -C ~/cnoc pull --ff-only && bun install --cwd ~/cnoc --frozen-lockfile"
+}

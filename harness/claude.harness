@@ -1,0 +1,9 @@
+# Claude Code, interactive, with the task as its first message.
+# ${TASK} is the job's PROMPT followed by the standard instructions for reporting a result.
+REQUIRE claude
+TMUX claude --dangerously-skip-permissions ${ARGS} ${TASK}
+# The banner only appears once Claude Code is past its start-up prompts. If the project
+# directory has never been trusted on this host, or the login has expired, this times out
+# and the failure reason quotes what the screen showed instead.
+EXPECT "Claude Code v" TIMEOUT 45
+STOP TYPE "/exit" Enter

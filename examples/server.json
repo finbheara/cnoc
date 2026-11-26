@@ -1,0 +1,7 @@
+{
+  "dataDir": "~/.local/share/cnoc",
+  "port": 7878,
+  "hostname": "0.0.0.0",
+  "pools": { "claude-max": 3 },
+  "starveAfterS": 600
+}

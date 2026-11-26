@@ -1,0 +1,79 @@
+# Plan
+
+What exists, what does not, and the order to build the rest. The design is in [SPEC.md](SPEC.md).
+
+## Built and tested
+
+Tested means covered by `bun test`: 41 unit tests and 22 end-to-end tests that run a real server, real clients and real tmux sessions.
+
+| Area | What works |
+|---|---|
+| Jobfile | Front matter, `FROM` / `HARNESS` / `PROMPT` / `ENV`, heredocs, multi-stage jobs, line-numbered errors, `cnoc check`. |
+| Adapters | `REQUIRE`, `TMUX`, `EXPECT`, `TYPE`, `SLEEP`, `STOP`; `claude`, `codex` and `shell` built in; extra directory via `harness_dir`. |
+| Server | Atomic idempotent batch submit, dependency edges, cancel, requeue, abandon, drain, SQLite persistence. |
+| Placement | Counted host resources, fleet pools, features, priority and age, decline backoff, starvation hold-back, policy loaded from a file. |
+| Client | Outbound WebSocket with reconnect, key generation and enrollment, resource and load reporting, local socket for the harness, on-disk outbox. |
+| Reconciliation | Client restart re-adopts sessions; results produced while the server was down are delivered later; vanished sessions and abandoned jobs are resolved. |
+| Changelog | Numbered events, paging and long-poll, server-sent events, signed in-order webhooks, `/v1/state` snapshot. |
+| Updates | A client on the wrong version takes no work, runs its update command and exits for its service manager. |
+| Git intake | `cnoc ingest` of a checkout's `jobs/` directory. |
+
+Checked by hand, not by the test suite:
+
+- A real Claude Code session through the `claude` adapter: launched, did the task, reported with `cnoc done`, exited on the stop sequence.
+- The same adapter against a directory Claude Code had not been told to trust: failed after 45 seconds with the prompt text in the reason.
+- Server and client as separate processes driven through the CLI, including host approval.
+
+Not exercised at all: the `codex` adapter, Linux, and more than one host at a time on separate machines.
+
+## Not built
+
+In rough order of value.
+
+### 1. Make it installable
+
+- **Service install.** `cnoc client install` writing a systemd unit or launchd plist. Today you start it yourself.
+- **Launcher and payload split.** A small, rarely changing launcher that fetches a pinned version, verifies its hash and starts it. Today `update` is whatever shell command the host config names, which is only as safe as that command.
+- **Published package**, so a host does not need a clone.
+- **TLS** in the server, or a documented reverse-proxy setup.
+
+### 2. Accounting
+
+- **Tokens and spend per attempt.** Nothing is collected yet. Options: an adapter `USAGE` step, the harness's own transcript, or a `mcx` adapter that already tracks it.
+- **Per-job CPU and memory.** Only host-level load is measured.
+- **Budgets** that stop a job, and quota-aware admission for shared subscriptions. Pools cap concurrency today, not consumption.
+- **A stalled state** for a session waiting on a usage-limit reset. It currently just runs until its time limit.
+
+### 3. Isolation and cleanup
+
+- **`WORKTREE`** as an instruction, and a ZFS-clone equivalent, with matching teardown. Today a job runs in the project checkout and the harness's own prompts handle worktrees.
+- **Footprint cleanup**: per-job temp directory, sweep of harness-private paths, a reaper for leftovers. Nothing is cleaned today except the tmux session.
+- **`RUN`** for trusted authors, with a paired cleanup step.
+
+### 4. Trust
+
+- **Roles and more than one token.** There is one admin token. Outside submitters should be able to create held jobs that a person releases.
+- **Hold and release.**
+- **A directory repository** for host keys and version pins, so enrollment and upgrades are reviewed changes. Today approval is one CLI command and the version is whatever the server runs.
+- **Signed changelog entries** and prompts encrypted to host keys. These matter only if the server is ever run by someone else.
+
+### 5. Git as a full intake path
+
+- The server merging job pull requests whose checks pass.
+- Status pushed back to the repository.
+- Cancel by a front-matter edit.
+
+### 6. Reach
+
+- **`mcx` adapter**, delegating to a local `mcpd`, then `mcx cluster join` as a second client of this protocol.
+- **Logs from the server.** Scrollback is saved on the host; `cnoc log` should fetch it.
+- **Remote attach.**
+- **Automatic retry policy** per job. Requeue is manual.
+- **Server backup or a warm spare.** The whole state is one SQLite file; nothing copies it yet.
+
+## Open questions
+
+- **How long may a session sit idle?** A harness waiting at its prompt after finishing without reporting looks the same as one thinking. An idle-screen detector in the adapter would catch it sooner than the time limit.
+- **Should a failed stage keep its session?** It is removed today and only the scrollback is kept. Keeping it would allow a person to attach and continue.
+- **What is the version?** It is a string compared for equality. Pinning needs it to be a content hash.
+- **Where do host capacities live?** In each host's config today. A directory repository would make them reviewable, at the cost of a second place to edit.

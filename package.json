@@ -1,0 +1,14 @@
+{
+  "name": "cnoc",
+  "version": "0.1.0",
+  "description": "Batch scheduling of agent harness sessions across persistent hosts",
+  "license": "MIT",
+  "type": "module",
+  "bin": { "cnoc": "src/cli.ts" },
+  "scripts": {
+    "typecheck": "bun check",
+    "test": "bun test",
+    "am-i-done": "bun check && bun test"
+  },
+  "devDependencies": { "@types/bun": "latest" }
+}

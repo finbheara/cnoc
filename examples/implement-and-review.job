@@ -1,0 +1,20 @@
+---
+id: myapp/1234
+priority: 5
+resources: { slots: 1, claude-max: 1 }
+depends: [myapp/1201]
+time: 4h
+labels: { lane: A }
+---
+# FROM names a project. Each host maps it to its own checkout, and only hosts that have it are eligible.
+FROM myapp
+
+# One PROMPT is one harness session. Stages run in order; a failed stage ends the job.
+HARNESS claude --model opus
+PROMPT "/goal run a lane to implement #1234"
+
+HARNESS codex
+PROMPT <<END
+Review the branch for #1234 against main.
+Report done if it is ready to merge, fail with the blocking finding if not.
+END

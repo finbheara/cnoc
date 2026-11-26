@@ -1,0 +1,4 @@
+# Codex CLI, interactive, with the task as its first message. Not yet exercised end to end.
+REQUIRE codex
+TMUX codex ${ARGS} ${TASK}
+STOP TYPE "/quit" Enter
