@@ -17,14 +17,18 @@ Tested means covered by `bun test`: 41 unit tests and 22 end-to-end tests that r
 | Changelog | Numbered events, paging and long-poll, server-sent events, signed in-order webhooks, `/v1/state` snapshot. |
 | Updates | A client on the wrong version takes no work, runs its update command and exits for its service manager. |
 | Git intake | `cnoc ingest` of a checkout's `jobs/` directory. |
+| Client install | `install.sh`: clone, `cnoc` command, config, and a systemd user unit or launchd agent that leaves tmux sessions alone on restart. |
 
 Checked by hand, not by the test suite:
 
 - A real Claude Code session through the `claude` adapter: launched, did the task, reported with `cnoc done`, exited on the stop sequence.
 - The same adapter against a directory Claude Code had not been told to trust: failed after 45 seconds with the prompt text in the reason.
 - Server and client as separate processes driven through the CLI, including host approval.
+- The full test suite on Linux under WSL2 (Bun 1.4.5, tmux 3.4) and on a Debian container (Bun 1.4.4), as well as macOS.
+- `install.sh` through `curl | bash` on Linux with systemd, and from a local copy on macOS with launchd: install, approval, a job that kept running across a restart of the client service, re-run, and on macOS uninstall.
+- A server on one machine and a client on another: a shell job and a Claude Code job, both reported `done`.
 
-Not exercised at all: the `codex` adapter, Linux, and more than one host at a time on separate machines.
+Not exercised at all: the `codex` adapter, and more than one host connected at a time on separate machines.
 
 ## Not built
 
@@ -32,7 +36,7 @@ In rough order of value.
 
 ### 1. Make it installable
 
-- **Service install.** `cnoc client install` writing a systemd unit or launchd plist. Today you start it yourself.
+- **Server install.** The client has an installer; the server is a clone and a command you keep running yourself.
 - **Launcher and payload split.** A small, rarely changing launcher that fetches a pinned version, verifies its hash and starts it. Today `update` is whatever shell command the host config names, which is only as safe as that command.
 - **Published package**, so a host does not need a clone.
 - **TLS** in the server, or a documented reverse-proxy setup.
