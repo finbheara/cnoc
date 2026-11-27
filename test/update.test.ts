@@ -255,19 +255,31 @@ test("when installing the new commit's dependencies fails, the checkout goes bac
   expect(git(clone, "symbolic-ref", "--short", "HEAD")).toBe("main");
 });
 
+/** Runs `fn` with these environment variables set, and puts back what was there. */
+function withEnv<T>(vars: Record<string, string>, fn: () => T): T {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
 test("a git that refuses a checkout owned by someone else still reports its commit", () => {
   const { clone, commits } = fresh(1);
-  const saved = process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
-  process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = "1";
-  try {
+  const empty = join(specTempDir("cnoc-gitconfig-"), "gitconfig");
+  writeFileSync(empty, "");
+  // No global or system config, which might already trust every directory (CI runners do).
+  const env = { GIT_TEST_ASSUME_DIFFERENT_OWNER: "1", GIT_CONFIG_GLOBAL: empty, GIT_CONFIG_NOSYSTEM: "1" };
+  withEnv(env, () => {
     // Plain git refuses it, which is what a service user running someone's clone would see.
     expect(Bun.spawnSync(["git", "-C", clone, "rev-parse", "HEAD"], { env: process.env }).exitCode).not.toBe(0);
     expect(versionOf(clone)).toBe(commits[0] as string);
-  } finally {
-    // biome-ignore lint/performance/noDelete: assigning undefined would leave the string "undefined" set
-    if (saved === undefined) delete process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
-    else process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = saved;
-  }
+  });
 });
 
 test("a version that strands clients says why", () => {
