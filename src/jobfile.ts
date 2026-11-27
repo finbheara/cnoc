@@ -269,6 +269,8 @@ export interface TemplateArg {
 }
 
 const ARG_RE = /^([A-Z_][A-Z0-9_]*)(?:=([\s\S]*))?$/;
+/** What an ARG name may be, and so what `--set NAME=` may name. */
+export const ARG_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 
 function argLines(text: string): Array<TemplateArg & { line: number }> {
   const { body, bodyLine } = splitFrontMatter(text);

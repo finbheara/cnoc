@@ -16,7 +16,7 @@ Cnoc runs agent harness sessions as batch jobs across a small fleet of persisten
 
 **Out of scope**
 
-- A backlog, or any assumption about GitHub or an issue tracker. A job is self-contained.
+- A backlog, or any assumption about GitHub or an issue tracker. A job is self-contained. `cnoc feed` (§14) reads a backlog only through a command the operator supplies.
 - Planning. Each project plans its own work. A planning run is just another job, and a planner can subscribe to the changelog.
 - A definition of done, review, CI or merge policy. The agent reports its own result.
 - Pre-emption. A job that has started is never evicted by the scheduler.
@@ -292,7 +292,7 @@ Bearer token on every call except health. The admin token may do everything. A h
 | `GET /v1/events?after=&limit=&wait=` | A page of the changelog; `wait` long-polls up to 60 seconds. |
 | `GET /v1/events/stream?after=` | Server-sent events. `Last-Event-ID` also resumes. |
 | `POST`, `GET`, `DELETE /v1/subscriptions` | Admin. Webhooks. |
-| `GET /v1/health` | Version and protocol, no token. |
+| `GET /v1/health` | Version, protocol and `features` (`keyed-runs`), no token. |
 
 Every mutation returns the changelog sequence it reached. Every read returns `as_of`.
 
@@ -345,3 +345,20 @@ Specified but not built:
 | No time-based "lost" | Agent work is not safe to run twice. A person decides when to give up on a host. |
 | Submitter-chosen ids | Dependencies and git files need to name a job before the server has seen it. |
 | Separate from mcp-cli | That daemon is a per-user developer tool with a different lifecycle and far more credentials. It can be a harness adapter, and later a second client of this protocol. |
+
+## 14. Feeding from a backlog
+
+`cnoc feed [--every DURATION] [--max N] [--dry-run] -- COMMAND [ARGS...]` is a client of the HTTP API. The server knows nothing about it.
+
+- COMMAND is executed directly, without a shell, as the leader of a new process group, with an environment that lacks `CNOC_TOKEN` and `CNOC_SOCK`. It has two minutes, 10,000 lines and 16 MiB of standard output; only the end of its standard error is kept, for the log. On expiry or overflow the process group is sent SIGTERM, then SIGKILL after a grace period, and if the output pipes are still open a second later (held by a descendant that left the group) the reads are abandoned. When the command exits, anything still alive in its group is stopped the same way.
+- Its standard output is JSON lines, one template run each: `{ "template", "key"?, "set"?, "priority"?, "on"?, "begin"? }`. `template` is a name or a number; `set` maps ARG names to strings or to integers that JSON carries exactly (other numbers are refused, so a key cannot change by rounding); the last three are the overrides of §3.4. A null field is the same as an absent one. The key rules are those of §3.5; the server checks them. Blank lines are skipped. A line that is not a JSON object, or has an unknown or ill-typed field, is reported with its line number and skipped.
+- Each valid line is sent to `POST /v1/template/run` with `keyed: true`, so the server refuses a run for which neither the line nor the template gives a key. A key that exists answers `created: false` and creates nothing. Offering the whole backlog every pass is therefore safe, and the feeder holds no state.
+- A command that exits non-zero, is killed, times out or prints too much submits nothing from that pass.
+- `--max N`, default 10, stops a pass after N new jobs. Lines after that are not sent; they are offered again next pass.
+- Before its first submission the feeder reads `GET /v1/health` and refuses to submit anything unless `features` lists `keyed-runs`: an older server would make a new numbered job of every run, and a restarted feeder would make another each time. A run answer without `created` is treated the same way, as a second check.
+- A run the server refuses (400, 404, 409, 422) is reported with its line number and the pass goes on. 401 or 403 ends the feeder. Any other failure (no connection, a server error, a malformed answer, no answer within 30 seconds) ends the pass.
+- The feeder exits 78 (`EX_CONFIG`) when the server lacks keyed runs or refuses the token, with or without `--every`, so that a service manager can be told not to restart it.
+- A stop signal ends the command or the request in flight and sends no further lines; a second one exits at once.
+- Without `--every`: one pass, exit 1 if the command failed or any line was rejected. With it: passes start `DURATION` apart and never overlap; failures are logged and the loop goes on.
+- Output: one line per job created, one summary per pass (created, already there, rejected, held back). `--dry-run` runs the command and prints the runs it would offer, without contacting the server.
+- Nothing is retried by the feeder. A job that failed keeps its key, so it is not created again; `cnoc requeue` runs it again.

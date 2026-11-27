@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CnocClient, loadClientConfig } from "./client/client";
+import { feedCommand } from "./feed";
 import { JobfileError, checkTemplate, isTemplate, parseJob } from "./jobfile";
 import { type ChangeEvent, type Overrides, PROTOCOL } from "./protocol";
 import { ReportError, parseHandoff, report, snapshot } from "./report";
@@ -17,6 +18,8 @@ Run the services
   cnoc server [--data DIR] [--port 7878] [--host 127.0.0.1] [--config FILE] [--open-enrollment]
   cnoc client [--config ~/.config/cnoc/client.json] [--state ~/.local/state/cnoc]
   cnoc ingest DIR [--interval SECONDS]     submit every *.job under DIR/jobs, pulling DIR first if it is a git checkout
+  cnoc feed [--every DUR] [--max 10] [--dry-run] -- COMMAND...
+                                           submit each line COMMAND prints as a keyed template run (cnoc feed --help)
 
 Jobs
   cnoc check FILE...                       validate Jobfiles and templates without a server
@@ -83,7 +86,15 @@ const BOOLEAN = new Set(["all", "json", "follow", "open-enrollment", "help"]);
 const home = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 const str = (v: string | true | undefined, fallback: string): string => (typeof v === "string" ? v : fallback);
 
-class CliError extends Error {}
+class CliError extends Error {
+  /** The HTTP status, when the server answered. */
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
 
 /** Calls the server: through the client's local socket inside a job, directly otherwise. */
 /** What the server answers to a submission. */
@@ -92,7 +103,13 @@ type OneJob = { job: JobInfo };
 /** A template as listed: everything but its text. */
 type TemplateInfo = Omit<TemplateRow, "body">;
 
-async function api<T>(method: string, path: string, body?: unknown, contentType = "application/json"): Promise<T> {
+async function api<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  contentType = "application/json",
+  signal?: AbortSignal,
+): Promise<T> {
   const sock = process.env.CNOC_SOCK;
   let base: string;
   let token: string | undefined;
@@ -111,11 +128,12 @@ async function api<T>(method: string, path: string, body?: unknown, contentType 
     headers: { authorization: `Bearer ${token}`, ...(body !== undefined ? { "content-type": contentType } : {}) },
     body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
     ...(unix ? { unix } : {}),
+    ...(signal ? { signal } : {}),
   } as RequestInit).catch((e: Error) => {
     throw new CliError(`cannot reach ${unix ?? base}: ${e.message}`);
   });
   const out = (await res.json().catch(() => ({}))) as T & { error?: string };
-  if (!res.ok) throw new CliError(out.error ?? `${res.status} ${res.statusText}`);
+  if (!res.ok) throw new CliError(out.error ?? `${res.status} ${res.statusText}`, res.status);
   return out;
 }
 
@@ -397,6 +415,15 @@ async function main(): Promise<void> {
         await Bun.sleep(interval * 1000);
       }
     }
+
+    case "feed":
+      return process.exit(
+        await feedCommand(rest, {
+          health: (signal) => api<unknown>("GET", "/v1/health", undefined, undefined, signal),
+          run: (ref, body, signal) =>
+            api<unknown>("POST", `/v1/template/run?ref=${encodeURIComponent(ref)}`, body, undefined, signal),
+        }),
+      );
 
     case "queue": {
       const r = await api<{ jobs: JobInfo[] }>("GET", `/v1/jobs${flags.all ? "?all=1" : ""}`);
