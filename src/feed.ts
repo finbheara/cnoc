@@ -215,6 +215,9 @@ const describe = (l: FeedLine): string => {
   return parts.join(" ");
 };
 
+/** A request that was sent and then given up on: the server may or may not have acted on it. */
+class CutOff extends Error {}
+
 /** A call to the server that gives up on a stop or after the request timeout. */
 async function call<T>(deps: FeedDeps, f: (signal: AbortSignal) => Promise<T>): Promise<T> {
   const timeoutMs = deps.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
@@ -231,8 +234,8 @@ async function call<T>(deps: FeedDeps, f: (signal: AbortSignal) => Promise<T>): 
   try {
     return await Promise.race([f(signal), aborted]);
   } catch (e) {
-    if (timeout.aborted) throw new Error(`no answer from the server in ${timeoutMs / 1000}s`);
-    if (deps.signal?.aborted) throw new Error("stopped");
+    if (timeout.aborted) throw new CutOff(`no answer from the server in ${timeoutMs / 1000}s`);
+    if (deps.signal?.aborted) throw new CutOff("stopped");
     throw e;
   } finally {
     signal.removeEventListener("abort", onAbort);
@@ -241,7 +244,8 @@ async function call<T>(deps: FeedDeps, f: (signal: AbortSignal) => Promise<T>): 
 
 /**
  * Asks the server whether it does keyed runs. Without them every run would be a new numbered job,
- * so the feeder refuses to submit anything; it asks before its first submission.
+ * so the feeder refuses to submit anything. It asks on every pass that has something to offer, so
+ * a server replaced by an older one under a running feeder gets no job from it.
  */
 async function checkKeyedRuns(deps: FeedDeps): Promise<void> {
   const health = await call(deps, (signal) => deps.server.health(signal));
@@ -266,17 +270,8 @@ function readAnswer(r: unknown): { id: string; state: string; created: boolean }
   return { id, state, created: a.created };
 }
 
-/** State kept across passes: whether the server has been seen to do keyed runs. */
-interface FeedState {
-  keyedRuns: boolean;
-}
-
 /** One pass: run the source, then offer every valid line, stopping after `max` new jobs. */
-export async function feedPass(
-  opts: FeedOptions,
-  deps: FeedDeps,
-  state: FeedState = { keyedRuns: false },
-): Promise<PassResult> {
+export async function feedPass(opts: FeedOptions, deps: FeedDeps): Promise<PassResult> {
   const result: PassResult = { created: 0, existing: 0, rejected: 0, heldBack: 0 };
   const out = await runSource(opts.command, deps.limits ?? SOURCE_LIMITS, deps.signal);
   const errLines = out.stderr.split("\n").filter((l) => l.trim() !== "");
@@ -304,10 +299,9 @@ export async function feedPass(
     result.failure = why;
     deps.warn(`${PREFIX} pass stopped${line === undefined ? "" : ` at line ${line}`}: ${why}`);
   };
-  if (lines.length && !state.keyedRuns) {
+  if (lines.length) {
     try {
       await checkKeyedRuns(deps);
-      state.keyedRuns = true;
     } catch (e) {
       if (e instanceof FeedFatal) throw e;
       fatalIfAuth(e);
@@ -329,6 +323,10 @@ export async function feedPass(
     } catch (e) {
       if (e instanceof FeedFatal) throw e;
       fatalIfAuth(e);
+      if (e instanceof CutOff)
+        deps.warn(
+          `${PREFIX} line ${l.line}: the request for ${describe(l)} was cut off (${e.message}); its job may have been created`,
+        );
       const status = statusOf(e);
       if (status === undefined || !REFUSALS.has(status)) {
         stopPass((e as Error).message, l.line);
@@ -367,16 +365,15 @@ const pause = (ms: number, signal?: AbortSignal): Promise<void> =>
  * ends with EXIT_FATAL when the server lacks keyed runs or refuses the token.
  */
 export async function feed(opts: FeedOptions, deps: FeedDeps): Promise<number> {
-  const state: FeedState = { keyedRuns: false };
   try {
     if (opts.everyS === undefined) {
-      const r = await feedPass(opts, deps, state);
+      const r = await feedPass(opts, deps);
       return r.failure || r.rejected ? 1 : 0;
     }
     deps.log(`${PREFIX} every ${opts.everyS}s, at most ${opts.max} new jobs a pass: ${opts.command.join(" ")}`);
     while (!deps.signal?.aborted) {
       const started = performance.now();
-      await feedPass(opts, deps, state);
+      await feedPass(opts, deps);
       await pause(Math.max(0, opts.everyS * 1000 - (performance.now() - started)), deps.signal);
     }
     return 0;

@@ -71,10 +71,8 @@ const reaches = (jobId: string, want: string) =>
   });
 const events = async (): Promise<ChangeEvent[]> => (await api("GET", "/v1/events?after=0&limit=100000")).events;
 
-beforeAll(async () => {
-  mkdirSync(project, { recursive: true });
-  server = await new CnocServer({ dataDir: join(root, "data"), port: 0, openEnrollment: true, log: quiet }).start();
-  client = await new CnocClient({
+const newClient = () =>
+  new CnocClient({
     config: { server: server.url, name: "alpha", projects: { proj: project }, resources: { slots: 4 } },
     stateDir: join(root, "state-alpha"),
     tmuxSocket: socket,
@@ -82,7 +80,12 @@ beforeAll(async () => {
     log: quiet,
     // Not a git checkout: a test that gets the versions wrong can never move this repository.
     checkout: join(root, "not-a-checkout"),
-  }).start();
+  });
+
+beforeAll(async () => {
+  mkdirSync(project, { recursive: true });
+  server = await new CnocServer({ dataDir: join(root, "data"), port: 0, openEnrollment: true, log: quiet }).start();
+  client = await newClient().start();
   await until("alpha online", async () =>
     (await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "alpha" && h.online),
   );
@@ -211,4 +214,28 @@ test("a multi-stage job carries each stage's usage, and the handoff only of the 
   expect(ended?.handoff).toBeUndefined();
   expect((await ofJob(stopped, "job.terminal")())?.handoff).toBeUndefined();
   expect(await show(stopped)).toContain("stage 2: no report  ");
+});
+
+test("a report made while the client is restarting waits for it and arrives", async () => {
+  const j = id("restarting");
+  const go = join(root, "restarting-go");
+  const said = join(root, "restarting-stderr");
+  await submit(
+    job(j, prompt(`while [ ! -f ${go} ]; do sleep 0.1; done; cnoc handoff merged -m "after the restart" 2> ${said}`)),
+  );
+  await reaches(j, "running");
+  await client.stop();
+  writeFileSync(go, "");
+  // The session is now inside `cnoc handoff`, retrying against a socket that is gone.
+  const waiting = await until("the report to say it is waiting", async () => {
+    const text = await Bun.file(said)
+      .text()
+      .catch(() => "");
+    return text.includes("may be restarting") ? text : false;
+  });
+  expect(waiting.split("\n").filter((l) => l.includes("may be restarting"))).toHaveLength(1);
+  expect((await state(j)).state).toBe("running");
+  client = await newClient().start();
+  const done = await reaches(j, "done");
+  expect(done.result).toMatchObject([{ status: "done", summary: "after the restart", handoff: "MERGED" }]);
 });

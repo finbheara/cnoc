@@ -26,6 +26,8 @@ export const COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 export const DIRTY_SUFFIX = "-dirty";
 /** A version that is not a commit but is still safe to show, compare and pass on. */
 export const SAFE_VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
+/** What the server records for a host whose reported version is not safe to keep. Not itself a safe version, so no host can send it. */
+export const INVALID_VERSION = "(invalid)";
 /** A read-only git call at start-up may take this long; past it, the version is the fallback. */
 const GIT_READ_TIMEOUT_MS = 10_000;
 
@@ -147,5 +149,5 @@ export function shortVersion(v: string | null | undefined): string {
   const dirty = v.endsWith(DIRTY_SUFFIX);
   const base = dirty ? v.slice(0, -DIRTY_SUFFIX.length) : v;
   if (COMMIT.test(base)) return `${base.slice(0, 7)}${dirty ? DIRTY_SUFFIX : ""}`;
-  return SAFE_VERSION.test(v) ? v : JSON.stringify(printable(v, 60));
+  return SAFE_VERSION.test(v) || v === INVALID_VERSION ? v : JSON.stringify(printable(v, 60));
 }

@@ -1,5 +1,5 @@
 /**
- * The session side of the result contract: `cnoc done`, `fail`, `handoff` and `usage`, run by the
+ * The session side of the result contract: `cnoc done`, `fail`, `handoff`, `progress` and `usage`, run by the
  * harness inside a job, and the client-side check of what they send over the local socket.
  */
 import type { Outcome, StageResult, Usage } from "./protocol";
@@ -89,36 +89,110 @@ export function reportedFields(
   return { handoff: ended ? { handoff: ended } : {}, usage };
 }
 
-/** Calls the client's local socket with this attempt's token. */
-async function local<T>(path: string, body: unknown): Promise<T> {
+/** How long `cnoc done`, `fail` and `handoff` keep trying to reach a client that is not answering: a restart for an update takes about 10 seconds. */
+export const REPORT_RETRY_MS = 90_000;
+/** How long `cnoc progress` keeps trying. A note is best effort, so it waits out a quick restart and no more. */
+export const PROGRESS_RETRY_MS = 15_000;
+/** The pause between two tries to reach the client. */
+export const RETRY_EVERY_MS = 1_500;
+/** Lowers every retry budget, in milliseconds (0: no retry). For tests, and for anyone who would rather fail at once. */
+const RETRY_ENV = "CNOC_REPORT_WAIT_MS";
+
+/**
+ * The errors that mean the request never reached a client: no socket file, nothing listening on
+ * it, or the connection dropped before any answer. An HTTP answer, or a timeout after the request
+ * went out, is not one of these, and is final.
+ */
+const NOT_CONNECTED = new Set([
+  "ENOENT",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EPIPE",
+  "FailedToOpenSocket",
+  "ConnectionRefused",
+  "ConnectionClosed",
+]);
+export const notConnected = (e: unknown): boolean => NOT_CONNECTED.has(String((e as { code?: unknown } | null)?.code));
+
+export interface Retry {
+  /** Give up once this long has passed since the first try. 0: one try. */
+  ms: number;
+  everyMs?: number;
+  /** Told once, when the first retry starts. */
+  waiting?: (line: string) => void;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<unknown>;
+}
+
+/** The retry budget `ms`, lowered by CNOC_REPORT_WAIT_MS when that is set. */
+export function retryBudget(ms: number, env: Record<string, string | undefined> = process.env): number {
+  const raw = env[RETRY_ENV];
+  const cap = raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : ms;
+  return Math.min(ms, cap);
+}
+
+const seconds = (ms: number) => `${Math.round(ms / 1000)}s`;
+
+/**
+ * Calls the client's local socket with this attempt's token. With `retry`, a request that could
+ * not reach the client (it is restarting, say) is sent again until it does or the time is up. A
+ * restarted client serves the same socket path and re-adopts the attempt with the same token, so
+ * a retry lands; and a result already taken is answered "already reported", so sending one twice
+ * is safe.
+ */
+export async function local<T>(path: string, body: unknown, retry: Retry = { ms: 0 }): Promise<T> {
   const sock = process.env.CNOC_SOCK;
   const token = process.env.CNOC_TOKEN;
   if (!sock || !token) throw new ReportError("not inside a Cnoc job (CNOC_SOCK is not set)");
-  const res = await fetch(`http://localhost${path}`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify(body),
-    unix: sock,
-    signal: AbortSignal.timeout(LOCAL_SOCKET_MS),
-  } as RequestInit).catch((e: Error) => {
-    throw new ReportError(`cannot reach ${sock}: ${e.message}`);
-  });
+  const now = retry.now ?? Date.now;
+  const sleep = retry.sleep ?? Bun.sleep;
+  const start = now();
+  let res: Response | undefined;
+  for (let tries = 1; !res; tries++) {
+    try {
+      res = await fetch(`http://localhost${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+        unix: sock,
+        signal: AbortSignal.timeout(LOCAL_SOCKET_MS),
+      } as RequestInit);
+    } catch (e) {
+      const spent = now() - start;
+      const why = `cannot reach ${sock}: ${(e as Error).message}`;
+      // A budget above zero always gets at least one retry, however long the first try took.
+      if (!notConnected(e) || retry.ms === 0 || (tries > 1 && spent >= retry.ms))
+        throw new ReportError(tries > 1 ? `${why} (still, after ${seconds(spent)} of trying)` : why);
+      if (tries === 1)
+        retry.waiting?.(
+          `cnoc: the cnoc client is not answering (${String((e as { code?: unknown }).code)}); it may be restarting. Trying again for up to ${seconds(retry.ms)}`,
+        );
+      await sleep(Math.min(retry.everyMs ?? RETRY_EVERY_MS, Math.max(0, retry.ms - spent)));
+    }
+  }
   const out = (await res.json().catch(() => ({}))) as T & { error?: string };
   if (!res.ok) throw new ReportError(out.error ?? `${res.status} ${res.statusText}`);
   return out;
 }
 
+const toStderr = (line: string) => console.error(line);
+
 /** `cnoc done`, `cnoc fail` and `cnoc handoff`: the stage's one report, with the session's usage if it can be read. */
 export async function report(result: Pick<StageResult, "status" | "summary" | "handoff">): Promise<void> {
   if (!process.env.CNOC_SOCK) throw new ReportError("not inside a Cnoc job (CNOC_SOCK is not set)");
   const usage = await collectUsage();
-  const r = await local<{ accepted: boolean }>("/attempt/result", {
-    ...result,
-    ...stage(),
-    ...(usage ? { usage } : {}),
-  });
+  const r = await local<{ accepted: boolean }>(
+    "/attempt/result",
+    { ...result, ...stage(), ...(usage ? { usage } : {}) },
+    { ms: retryBudget(REPORT_RETRY_MS), waiting: toStderr },
+  );
   const what = result.handoff ? `handoff ${result.handoff} (${result.status})` : result.status;
   console.log(r.accepted ? `reported ${what}` : "a result was already reported for this stage");
+}
+
+/** `cnoc progress`: a note for the changelog. Best effort, so it waits only briefly for a client that is restarting. */
+export async function progress(note: string): Promise<void> {
+  await local("/attempt/progress", { note }, { ms: retryBudget(PROGRESS_RETRY_MS), waiting: toStderr });
 }
 
 const stage = (): { stage?: number } => {

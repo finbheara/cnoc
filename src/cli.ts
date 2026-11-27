@@ -6,7 +6,7 @@ import { CnocClient, loadClientConfig } from "./client/client";
 import { feedCommand } from "./feed";
 import { JobfileError, checkTemplate, isTemplate, parseJob } from "./jobfile";
 import { type ChangeEvent, type Overrides, PROTOCOL } from "./protocol";
-import { ReportError, parseHandoff, report, snapshot } from "./report";
+import { ReportError, parseHandoff, progress, report, snapshot } from "./report";
 import { CnocServer, type HostInfo, type JobInfo, type ServerOptions } from "./server/server";
 import type { AttemptRow, TemplateRow } from "./server/store";
 import { formatUsage } from "./usage";
@@ -531,8 +531,7 @@ async function main(): Promise<void> {
     }
 
     case "progress": {
-      if (!process.env.CNOC_SOCK) throw new CliError("not inside a Cnoc job (CNOC_SOCK is not set)");
-      await api<unknown>("POST", "/attempt/progress", { note: pos.join(" ") });
+      await progress(pos.join(" "));
       return;
     }
     // Each exits once its report is answered: a transcript read given up at its time limit may leave a file open.

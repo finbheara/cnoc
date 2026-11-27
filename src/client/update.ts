@@ -13,8 +13,9 @@
  *
  * Every try is recorded in `update.json` in the state directory, so the wait between tries grows
  * across restarts and not only within one process. If the disk refuses the record, it is kept in
- * memory. A new target is tried at once, but restarts for updates are capped per hour whatever
- * the target, so a server flapping between versions cannot make a host thrash. A client exits for
+ * memory. A new target is tried at once. Going back to a version this client already ran within
+ * the hour is capped, so a server flapping between versions cannot make a host thrash, while any
+ * number of new deploys go through. A client exits for
  * a restart only when that can help: the checkout moved, or the code was already in place but this
  * process may predate it.
  */
@@ -26,7 +27,10 @@ import { COMMIT, DIRTY_SUFFIX, SAFE_VERSION, checkoutOf, printable, shortVersion
 export const UPDATE_RETRY_BASE_MS = 60_000;
 /** The longest wait between two tries. */
 export const UPDATE_RETRY_MAX_MS = 30 * 60_000;
-/** At most this many restarts for updates within {@link UPDATE_RESTART_WINDOW_MS}, across all targets. */
+/**
+ * At most this many restarts within {@link UPDATE_RESTART_WINDOW_MS} may go back to a version this
+ * client already ran within that window. A version it has not run in the window always proceeds.
+ */
 export const UPDATE_RESTART_LIMIT = 5;
 export const UPDATE_RESTART_WINDOW_MS = 60 * 60_000;
 /** One git or bun step may take this long before it is stopped and the try counts as failed. */
@@ -36,6 +40,8 @@ const UPDATE_STEP_TIMEOUT_MS = 5 * 60_000;
  * The `update` command older configs carry: install.sh wrote one quoted form into every config,
  * and the example config showed an unquoted one. Both pull a branch, not the server's commit, so
  * they are ignored for the built-in procedure. install.sh uses this same pattern to remove them.
+ * install.sh also keeps a copy, LEGACY_UPDATE_SOURCE, for code from before this file: change both
+ * (test/install.test.ts fails while they differ).
  */
 export const LEGACY_UPDATE = /^git -C .* pull -q --ff-only && .* install --cwd .* --frozen-lockfile --production$/;
 
@@ -50,8 +56,31 @@ export interface UpdateState {
   /** Some try for this target has already ended in a restart. */
   restarted: boolean;
   at: number;
-  /** When recent tries ended in a restart, for any target. */
+  /**
+   * When recent tries ended in a restart, for any target. Kept as the previous version wrote it,
+   * so that a client downgraded to it still has its history; this version does not count it.
+   */
   restarts?: number[];
+  /** The version each recent restart left, and when. Absent in a record the previous version wrote. */
+  left?: Array<{ version: string; at: number }>;
+  /** When recent restarts went back to a version in `left`; these count against the limit. */
+  returns?: number[];
+  /** The wait is for {@link UPDATE_RESTART_LIMIT}, which may be longer than the longest retry wait. */
+  held?: boolean;
+}
+
+/** How the previous version said it was holding for its restart limit, which counted every restart. */
+const LEGACY_HOLD = /restarts for updates in the last hour/;
+
+/**
+ * A record as this version reads it. One written by the previous version has no `left`: its
+ * restarts name no versions, so none of them counts as a return, and a hold it made for its
+ * restart limit (which counted new deploys too) is dropped, so the target is tried at once.
+ */
+export function readState(raw: UpdateState): UpdateState {
+  if (Array.isArray(raw.left)) return raw;
+  const legacyHold = typeof raw.reason === "string" && LEGACY_HOLD.test(raw.reason);
+  return { ...raw, left: [], returns: [], ...(legacyHold ? { next_at: 0, reason: null } : {}) };
 }
 
 export class UpdateError extends Error {}
@@ -107,10 +136,20 @@ export class Updater {
   state(): UpdateState | null {
     if (this.mem !== undefined) return this.mem;
     try {
-      return JSON.parse(readFileSync(this.file, "utf8")) as UpdateState;
+      return readState(JSON.parse(readFileSync(this.file, "utf8")) as UpdateState);
     } catch {
       return null; // none yet, or unreadable: either way there is no backoff to honour
     }
+  }
+
+  /** The restart history still inside the window at `now`. */
+  private history(s: UpdateState | null, now: number): Required<Pick<UpdateState, "restarts" | "left" | "returns">> {
+    const recent = (t: number) => now - t < UPDATE_RESTART_WINDOW_MS && t <= now;
+    return {
+      restarts: (s?.restarts ?? []).filter(recent),
+      left: (s?.left ?? []).filter((l) => recent(l.at)),
+      returns: (s?.returns ?? []).filter(recent),
+    };
   }
 
   /** The versions agree again: forget past tries, but not the restart history. */
@@ -118,10 +157,10 @@ export class Updater {
     const s = this.state();
     if (!s || s.target === "") return;
     const now = this.now();
-    const restarts = (s.restarts ?? []).filter((t) => now - t < UPDATE_RESTART_WINDOW_MS);
-    if (restarts.length > 0) {
+    const h = this.history(s, now);
+    if (h.restarts.length + h.left.length + h.returns.length > 0) {
       // Keep only what the flap guard needs; no target, so nothing waits on it.
-      this.record({ target: "", tries: 0, next_at: 0, reason: null, restarted: false, at: now, restarts });
+      this.record({ target: "", tries: 0, next_at: 0, reason: null, restarted: false, at: now, ...h });
       return;
     }
     this.mem = null;
@@ -132,11 +171,14 @@ export class Updater {
     }
   }
 
-  /** Milliseconds until a try for `target` is due; 0 when it is due now. Never more than the longest wait, whatever the clock did. */
+  /**
+   * Milliseconds until a try for `target` is due; 0 when it is due now. Never more than the
+   * longest wait (the restart window, for a hold on the restart limit), whatever the clock did.
+   */
   dueIn(target: string): number {
     const s = this.state();
     if (!s || s.target !== target) return 0;
-    return Math.min(Math.max(0, s.next_at - this.now()), UPDATE_RETRY_MAX_MS);
+    return Math.min(Math.max(0, s.next_at - this.now()), s.held ? UPDATE_RESTART_WINDOW_MS : UPDATE_RETRY_MAX_MS);
   }
 
   /** One line for the server about what this client is doing to reach `target`. */
@@ -170,11 +212,14 @@ export class Updater {
     const same = prev?.target === target ? prev : null;
     const tries = (same?.tries ?? 0) + 1;
     const start = this.now();
-    const restarts = (prev?.restarts ?? []).filter((t) => start - t < UPDATE_RESTART_WINDOW_MS && t <= start);
+    const h = this.history(prev, start);
+    // Only going back to a version this client ran within the window can be a flap.
+    const back = h.left.some((l) => l.version === target);
 
-    if (restarts.length >= UPDATE_RESTART_LIMIT) {
-      const wait = Math.max(retryDelayMs(tries), (restarts[0] ?? start) + UPDATE_RESTART_WINDOW_MS - start);
-      const reason = `${restarts.length} restarts for updates in the last hour; is the server's version changing back and forth?`;
+    if (back && h.returns.length >= UPDATE_RESTART_LIMIT) {
+      // Due when the oldest return leaves the window, and the budget has room again.
+      const wait = Math.max(1000, Math.min(...h.returns) + UPDATE_RESTART_WINDOW_MS - start);
+      const reason = `${h.returns.length} restarts in the last hour went back to a version this client had already run; is the server's version changing back and forth?`;
       this.record({
         target,
         tries,
@@ -182,11 +227,10 @@ export class Updater {
         reason,
         restarted: same?.restarted === true,
         at: start,
-        restarts,
+        ...h,
+        held: true,
       });
-      this.o.log(
-        `not updating to ${short(target)} yet: ${reason} Next try in ${duration(Math.min(wait, UPDATE_RETRY_MAX_MS))}`,
-      );
+      this.o.log(`not updating to ${short(target)} yet: ${reason} Next try in ${duration(wait)}`);
       return false;
     }
 
@@ -210,7 +254,13 @@ export class Updater {
       reason,
       restarted: restart || same?.restarted === true,
       at: now,
-      restarts: restart ? [...restarts, now] : restarts,
+      ...(restart
+        ? {
+            restarts: [...h.restarts, now],
+            left: [...h.left, { version: this.o.version, at: now }],
+            returns: back ? [...h.returns, now] : h.returns,
+          }
+        : h),
     });
     this.o.log(
       restart

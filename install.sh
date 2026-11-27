@@ -40,6 +40,9 @@ UNIT=$HOME/.config/systemd/user/cnoc-client.service
 PLIST=$HOME/Library/LaunchAgents/cnoc.client.plist
 LABEL=cnoc.client
 LOG=$HOME/Library/Logs/cnoc-client.log
+# KEEP IN SYNC with LEGACY_UPDATE in src/client/update.ts (test/install.test.ts checks they are the
+# same). Used only when the code checked out (an old --ref) has no src/client/update.ts.
+LEGACY_UPDATE_SOURCE='^git -C .* pull -q --ff-only && .* install --cwd .* --frozen-lockfile --production$'
 
 have_systemd() { [ "$(uname -s)" = Linux ] && systemctl --user show-environment >/dev/null 2>&1; }
 have_launchd() { [ "$(uname -s)" = Darwin ] && command -v launchctl >/dev/null 2>&1; }
@@ -162,18 +165,20 @@ main() {
     name=$("$bun" -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).name ?? "")' "$CONFIG")
     # Older installers wrote an "update" command that pulls a branch; the client now updates itself
     # to the server's exact commit and ignores that command, so it is removed to avoid confusion.
-    # The pattern is the client's own, so the two cannot disagree about what is old.
+    # The pattern is the client's own, so the two cannot disagree about what is old; code from
+    # before that file (an old --ref) gets the copy above.
     "$bun" -e '
       const fs = require("node:fs");
-      const [f, app] = process.argv.slice(1);
-      const { LEGACY_UPDATE } = require(app + "/src/client/update.ts");
+      const [f, app, copy] = process.argv.slice(1);
+      const own = app + "/src/client/update.ts";
+      const LEGACY_UPDATE = fs.existsSync(own) ? require(own).LEGACY_UPDATE : new RegExp(copy);
       const cfg = JSON.parse(fs.readFileSync(f, "utf8"));
       if (LEGACY_UPDATE.test(cfg.update ?? "")) {
         delete cfg.update;
         fs.writeFileSync(f, JSON.stringify(cfg, null, 2) + "\n");
         console.log("==> removed the old update command from " + f);
       }
-    ' "$CONFIG" "$APP"
+    ' "$CONFIG" "$APP" "$LEGACY_UPDATE_SOURCE"
     say "kept $CONFIG"
   fi
 

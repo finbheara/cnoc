@@ -151,7 +151,7 @@ cnoc template run lane --key hotfix --set PROJECT=myapp --set ISSUE=1   # submit
 ```
 
 - A second run with the same key does nothing and says so, whatever state the job is in and whatever has changed in the arguments or the template since. A failed run is started again with `cnoc requeue`, not by running the template again.
-- A key may not be all digits, since those are the numbers of unkeyed runs; `issue-4` and `myapp/4` are fine. A job by that id that the template did not start is refused, not taken for the run.
+- A key may not be all digits, since those are the numbers of unkeyed runs; `issue-4` and `myapp/4` are fine. A template may declare `key: ${ISSUE}`, but a run with `ISSUE=4` is then refused: write `key: issue-${ISSUE}`. A job by that id that the template did not start is refused, not taken for the run.
 - A run without a key is numbered as before.
 
 ## Reporting a result
@@ -167,6 +167,8 @@ cnoc handoff BLOCKED -m "review asked for a redesign"   # failed; the message is
 ```
 
 The built-in adapters append these instructions to the prompt, worded so that a prompt naming its own closing command (`… then run cnoc handoff MERGED`) is followed instead. A session that ends without reporting is `failed` with reason `no-result`.
+
+If the client is restarting (it does that to update itself), `done`, `fail` and `handoff` say so once on stderr and keep trying for up to 90 seconds, so finished work is not lost; `progress` waits up to 15 seconds.
 
 `handoff` takes `MERGED` or `BLOCKED` in any case. The status is stored as its own `handoff` field on the stage's result and in the `attempt.ended` and `job.terminal` events, so a subscriber can tell an agent that handed the work back blocked from a session that crashed without reading the text. It is unrelated to the `blocked` job state, which means waiting on a dependency.
 
@@ -228,7 +230,7 @@ Update the server and the clients follow. On the server: `git pull`, then restar
 - The server must run a commit that is pushed to the repository the clients cloned. A server with uncommitted changes reports `COMMIT-dirty`, which no client can reach.
 - A client that cannot update (commit not pushed, network down, local changes in its clone) logs one line saying why and tries again after 1, 2, 4… minutes, at most every 30 minutes. A new server version is tried at once.
 - `cnoc hosts` shows the server's version and each host's, and for a host that has not caught up, what it last said about its update. `cnoc version` prints both versions.
-- At most 5 updates an hour end in a restart, so a server whose version changes back and forth cannot make hosts thrash.
+- Every new version is taken at once, however many deploys an hour. Only going back to a version a host already ran within the hour is limited, to 5 an hour, so a server whose version changes back and forth cannot make hosts thrash; the host says how long it is holding.
 - A server or client whose version is the fallback (git could not say which commit it runs) or ends in `-dirty` logs a `WARNING` line at start. Either one strands the other hosts.
 - `--ref` only chooses what the installer checks out first. From the first connection on, the client runs whatever commit the server runs.
 - **Hosts installed before this.** Their old code updates with `git pull` of the branch they were installed from. On `main` that reaches the new code without help. A host installed with `--ref` on another branch, or whose pull fails, restarts every few seconds without catching up: run the installer on it once.
@@ -309,8 +311,8 @@ cnoc feed --dry-run -- examples/feed-github-issues.sh example-org/myapp ready-fo
 - The command runs without a shell (use `sh -c '...'` if you need one), in its own process group. It has two minutes, 10,000 lines and 16 MiB of output. If it fails, times out or prints more, nothing from that pass is submitted, even lines it printed. On a timeout the process group gets SIGTERM, then SIGKILL; a descendant that started a session of its own is outside the group and is not stopped, but the feeder stops waiting for it. Anything still running in the group after the command exits is stopped too. A bad line is reported with its line number and the other lines still go.
 - The command does not get `CNOC_TOKEN` (or `CNOC_SOCK`); it has no access to the server. The feeder logs the command and its arguments when it starts, so do not pass secrets as arguments; give them to the command through its own environment or config.
 - It prints a line per job it creates and one summary per pass, and nothing for items that already exist.
-- Each request has 30 seconds. SIGTERM or SIGINT stops the command or the request in flight and ends the feeder after that pass; a second one exits at once.
-- Exit status 78 means carrying on cannot help: the server does not do keyed runs (it says so in `/v1/health`, which the feeder asks before submitting anything), or it refuses the token. Tell the service manager not to restart on it.
+- Each request has 30 seconds. One that is cut off is logged with its template and key as possibly created. SIGTERM or SIGINT stops the command or the request in flight and ends the feeder after that pass; a second one exits at once.
+- Exit status 78 means carrying on cannot help: the server does not do keyed runs (it says so in `/v1/health`, which the feeder asks on every pass before submitting anything), or it refuses the token. Tell the service manager not to restart on it.
 - The feeder keeps no state. Removing the label stops an issue being offered but does not cancel its job. A job that failed stays failed: listing it again does nothing, and it runs again only when someone runs `cnoc requeue`.
 
 As a systemd user service:

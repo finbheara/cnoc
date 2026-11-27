@@ -237,6 +237,7 @@ test("SIGTERM during submission to a server that never answers ends the feeder p
     expect(r.code).toBe(0);
     expect(r.err).toEqual([
       "[feed] SIGTERM: stopping; send it again to exit at once",
+      "[feed] line 1: the request for t key a was cut off (stopped); its job may have been created",
       "[feed] pass stopped at line 1: stopped",
       "[feed] pass: 0 created, 0 already there, 0 rejected (stopped early)",
     ]);

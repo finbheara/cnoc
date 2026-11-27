@@ -248,6 +248,23 @@ describe("template keys", () => {
     expect(() => checkTemplate(KEYED.replace("${PROJECT}-${HOURS}", "[1, 2]"))).toThrow(/not a valid id segment/);
   });
 
+  test("a key of one bare argument without a default passes the check; a run that makes it all digits is refused", () => {
+    const bare = "---\nid: lane\nkey: ${ISSUE}\n---\nARG ISSUE\nFROM app\nHARNESS shell\nPROMPT echo ${ISSUE}\n";
+    expect(checkTemplate(bare)).toEqual({ name: "lane", args: [{ name: "ISSUE", default: null }] });
+    expect(checkTemplate(bare.replace("key: ${ISSUE}", "key: ${ISSUE}/${ISSUE}")).name).toBe("lane");
+  });
+
+  test("a key error found by the check names the template's text, not the stand-in", () => {
+    const k = (key: string, arg = "ARG ISSUE") =>
+      `---\nid: lane\nkey: ${key}\n---\n${arg}\nFROM app\nHARNESS shell\nPROMPT true\n`;
+    expect(() => checkTemplate(k("${ISSUE}/.."))).toThrow('line 3: key "${ISSUE}/.." has a . or .. segment');
+    expect(() => checkTemplate(k("a ${ISSUE}"))).toThrow('line 3: key "a ${ISSUE}" is not a valid id segment');
+    // A default that makes the key all digits is caught, with the fix.
+    expect(() => checkTemplate(k("${ISSUE}", "ARG ISSUE=12"))).toThrow(
+      'line 3: key "${ISSUE}" is all digits, which are the numbers of unkeyed runs; prefix the key in template lane, as in key: run-${ISSUE}',
+    );
+  });
+
   test("key is legal only in a template", () => {
     const plain = "---\nid: a\nkey: b\n---\nFROM app\nHARNESS shell\nPROMPT true\n";
     expect(() => parseJob(plain)).toThrow(/key belongs in a template/);

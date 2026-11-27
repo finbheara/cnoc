@@ -9,6 +9,7 @@ import { specTempDir } from "../scripts/testkit";
 import {
   LEGACY_UPDATE,
   UPDATE_RESTART_LIMIT,
+  UPDATE_RESTART_WINDOW_MS,
   UPDATE_RETRY_BASE_MS,
   UPDATE_RETRY_MAX_MS,
   UpdateError,
@@ -17,7 +18,7 @@ import {
   updateCheckout,
 } from "../src/client/update";
 import { VERSION } from "../src/protocol";
-import { checkoutOf, shortVersion, versionOf, versionProblem } from "../src/version";
+import { INVALID_VERSION, checkoutOf, shortVersion, versionOf, versionProblem } from "../src/version";
 import { commit, git, makeRepos } from "./git-fixture";
 
 const bun = process.execPath;
@@ -75,6 +76,8 @@ test("a version is shortened for people only when it is a commit", () => {
   // Text from a server is never printed raw.
   expect(shortVersion("\u001b[2Jx-dirty\nforged")).toBe('" [2Jx-dirty forged"');
   expect(shortVersion(null)).toBe("-");
+  // What the server records for a version it rejected is shown as it is, not quoted as if a host sent it.
+  expect(shortVersion(INVALID_VERSION)).toBe("(invalid)");
 });
 
 test("an update goes to exactly the server's commit, not to the tip of main", async () => {
@@ -202,10 +205,8 @@ test("the update command an older installer wrote is ignored for the built-in on
   const example =
     "git -C ~/.local/share/cnoc/app pull -q --ff-only && bun install --cwd ~/.local/share/cnoc/app --frozen-lockfile --production";
   expect(LEGACY_UPDATE.test(example)).toBe(true);
-  // install.sh removes old commands with this very pattern rather than a copy of it.
-  expect(readFileSync(join(import.meta.dir, "..", "install.sh"), "utf8")).toContain(
-    'const { LEGACY_UPDATE } = require(app + "/src/client/update.ts");',
-  );
+  // install.sh removes old commands with this very pattern, and its copy for old code is checked in install.test.ts.
+  expect(readFileSync(join(import.meta.dir, "..", "install.sh"), "utf8")).toContain("require(own).LEGACY_UPDATE");
   const { u, lines } = updater(clone, specTempDir("cnoc-update-state-"), { t: 0 }, { command: legacy });
   expect(lines).toEqual([expect.stringMatching(/an older install.sh wrote it.*re-run install.sh, to silence this$/)]);
   expect(await u.attempt(commits[1] as string)).toBe(true);
@@ -327,32 +328,111 @@ test("the wait never exceeds the cap, even if the clock jumps back", async () =>
   expect(u.dueIn("0".repeat(40))).toBe(UPDATE_RETRY_MAX_MS);
 });
 
-test("a server flapping between versions cannot make a host restart more than the limit", async () => {
-  const { clone, commits } = fresh(3);
+/** One restart onto `target` per call, each by a new process on the code the last one checked out, `step` ms apart. */
+async function restartsOnto(clone: string, state: string, clock: { t: number }, targets: string[], step: number) {
+  const out: boolean[] = [];
+  for (const target of targets) {
+    const { u } = updater(clone, state, clock, { version: versionOf(clone) });
+    out.push(await u.attempt(target));
+    clock.t += step;
+  }
+  return out;
+}
+
+test("any number of new deploys in an hour goes through", async () => {
+  const n = UPDATE_RESTART_LIMIT + 3;
+  const { clone, commits } = fresh(n + 1);
   const state = specTempDir("cnoc-update-state-");
   const clock = { t: 1_000_000 };
-  const targets = [commits[1], commits[2]] as [string, string];
-  let restarts = 0;
-  for (let i = 0; i < UPDATE_RESTART_LIMIT; i++) {
-    // Each restart is a new process on the code it just checked out.
-    const { u } = updater(clone, state, clock, { version: versionOf(clone) });
-    if (await u.attempt(targets[i % 2] as string)) restarts++;
-    clock.t += 15_000;
-  }
-  expect(restarts).toBe(UPDATE_RESTART_LIMIT);
+  expect(await restartsOnto(clone, state, clock, commits.slice(1), 5 * 60_000)).toEqual(Array(n).fill(true));
+  expect(head(clone)).toBe(commits[n] as string);
+});
+
+test("a server flapping between versions is held once returns reach the limit, for exactly as long as it says", async () => {
+  const { clone, commits } = fresh(4);
+  const state = specTempDir("cnoc-update-state-");
+  const t0 = 1_000_000;
+  const clock = { t: t0 };
+  const step = 15_000;
+  const [a, b] = [commits[1], commits[2]] as [string, string];
+  // From commits[0]: a and b are new, then every flip goes back to one this client ran.
+  const flips = Array.from({ length: UPDATE_RESTART_LIMIT + 2 }, (_, i) => (i % 2 ? b : a));
+  expect(await restartsOnto(clone, state, clock, flips, step)).toEqual(Array(flips.length).fill(true));
   const at = head(clone);
   const { u, lines } = updater(clone, state, clock, { version: versionOf(clone) });
-  const next = targets[UPDATE_RESTART_LIMIT % 2] as string;
+  const next = versionOf(clone) === a ? b : a;
   expect(await u.attempt(next)).toBe(false);
   expect(head(clone)).toBe(at);
+  // The oldest return was the third restart; the budget has room when it leaves the hour.
+  const wait = t0 + 2 * step + UPDATE_RESTART_WINDOW_MS - clock.t;
+  expect(wait).toBeGreaterThan(UPDATE_RETRY_MAX_MS);
   expect(lines).toEqual([
-    expect.stringMatching(
-      /^not updating to \w{7} yet: 5 restarts for updates in the last hour; is the server's version changing back and forth\? Next try in \d+m$/,
-    ),
+    `not updating to ${shortVersion(next)} yet: ${UPDATE_RESTART_LIMIT} restarts in the last hour went back to a version this client had already run; is the server's version changing back and forth? Next try in 59m`,
   ]);
+  expect(u.dueIn(next)).toBe(wait);
+  const now = clock.t;
+  clock.t -= 10 * 3_600_000; // the clock jumps back: the hold is still bounded by the window
+  expect(u.dueIn(next)).toBe(UPDATE_RESTART_WINDOW_MS);
+  clock.t = now;
+  expect(u.note(next)).toEndWith("next try in 59m");
+
+  // A version the client has not run goes through while the flap is held.
+  const { u: other } = updater(clone, state, clock, { version: versionOf(clone) });
+  expect(await other.attempt(commits[3] as string)).toBe(true);
+
   // Agreeing with the server does not wipe the history the limit is counted from.
-  u.clear();
-  expect(u.state()?.restarts).toHaveLength(UPDATE_RESTART_LIMIT);
+  const { u: agreed } = updater(clone, state, clock, { version: versionOf(clone) });
+  agreed.clear();
+  expect(agreed.state()?.returns).toHaveLength(UPDATE_RESTART_LIMIT);
+  expect(agreed.state()?.restarts).toHaveLength(flips.length + 1);
+
+  // Once the oldest return is out of the window, going back is allowed again.
+  clock.t = t0 + 2 * step + UPDATE_RESTART_WINDOW_MS;
+  const { u: later } = updater(clone, state, clock, { version: versionOf(clone) });
+  expect(await later.attempt(next)).toBe(true);
+});
+
+test("a record the previous version wrote is read without its restarts counting, and stays readable to it", async () => {
+  const { clone, commits } = fresh(3);
+  const state = specTempDir("cnoc-update-state-");
+  const now = 10_000_000;
+  const clock = { t: now };
+  const old = (over: object) =>
+    writeFileSync(
+      join(state, "update.json"),
+      JSON.stringify({
+        target: commits[1],
+        tries: 1,
+        next_at: now + 20 * 60_000,
+        reason: null,
+        restarted: true,
+        at: now - 60_000,
+        restarts: [1, 2, 3, 4, 5].map((i) => now - i * 60_000),
+        ...over,
+      }),
+    );
+
+  // What the old code left on the restart that brought this code in: the next deploy goes through.
+  old({});
+  const first = updater(clone, state, clock, { version: commits[1] as string });
+  first.u.clear();
+  expect(first.u.state()).toMatchObject({ target: "", left: [], returns: [] });
+  expect(first.u.state()?.restarts).toHaveLength(5);
+  expect(await first.u.attempt(commits[2] as string)).toBe(true);
+  // Still the previous version's fields and types, so a client downgraded to it reads it.
+  const onDisk = JSON.parse(readFileSync(join(state, "update.json"), "utf8"));
+  expect(onDisk).toMatchObject({ target: commits[2], tries: 1, restarted: true, reason: null });
+  expect(typeof onDisk.next_at).toBe("number");
+  expect(onDisk.restarts).toHaveLength(6);
+  expect(onDisk.restarts.every((t: unknown) => typeof t === "number")).toBe(true);
+
+  // A hold the old code made for its restart limit is dropped: the target is tried at once.
+  old({ reason: "5 restarts for updates in the last hour; is the server's version changing back and forth?" });
+  const held = updater(clone, state, clock, { version: commits[0] as string });
+  expect(held.u.dueIn(commits[1] as string)).toBe(0);
+  // Any other backoff it recorded is honoured as it was.
+  old({ reason: "commit 0123456 is not on origin; was it pushed?" });
+  expect(updater(clone, state, clock).u.dueIn(commits[1] as string)).toBe(20 * 60_000);
 });
 
 test("a configured command that leaves a git checkout short of the target is not trusted", async () => {

@@ -243,7 +243,7 @@ test("a refused token stops the feeder with 78, in a loop too", async () => {
   }
 });
 
-test("health is asked once, before the first submission, and not for an empty backlog", async () => {
+test("health is asked on every pass that has something to offer, and not for an empty backlog", async () => {
   const f = fake();
   await feed(opts(source([])), f.deps);
   expect(f.healthChecks()).toBe(0);
@@ -257,7 +257,22 @@ test("health is asked once, before the first submission, and not for an empty ba
     log,
     signal: stop.signal,
   });
-  expect(f.healthChecks()).toBe(1);
+  expect(f.healthChecks()).toBe(3);
+});
+
+test("a server downgraded under a running feeder gets no job from it, and the feeder exits 78", async () => {
+  let downgraded = false;
+  const f = fake({
+    health: async () => (downgraded ? { ok: true, version: "0.1.0" } : { ok: true, features: ["keyed-runs"] }),
+  });
+  const log = (l: string) => {
+    if (l.startsWith("[feed] pass:")) downgraded = true;
+  };
+  const backlog = source([line({ template: "lane", key: "a" })]);
+  expect(await feed(opts(backlog, { everyS: 0 }), { ...f.deps, log })).toBe(EXIT_FATAL);
+  // The first pass created the job; the second, against the older server, sent nothing.
+  expect(f.calls.length).toBe(1);
+  expect(f.healthChecks()).toBe(2);
 });
 
 test("a lost server, a server error or a malformed answer stops the pass after what was created", async () => {
@@ -303,6 +318,9 @@ test("a stop during submission sends nothing more, and a request that is never a
   expect(g.calls.map((c) => c.body.key)).toEqual(["a", "b"]);
   // The stop came while b was in flight, so its answer is not waited for; c is never sent.
   expect(r).toMatchObject({ created: 1, failure: "stopped" });
+  expect(g.err[0]).toBe(
+    "[feed] line 2: the request for lane key b was cut off (stopped); its job may have been created",
+  );
 
   // A server that takes the request and never answers: a stop ends the wait, and so does the timeout.
   const hang: FeedServer["run"] = (_ref, _body, signal) =>
@@ -317,9 +335,13 @@ test("a stop during submission sends nothing more, and a request that is never a
   expect(await feedPass(opts(backlog), { ...h.deps, signal: stop2.signal })).toMatchObject({ failure: "stopped" });
   expect(h.calls.length).toBe(1);
   const t = fake({ run: hang });
+  const why = `no answer from the server in ${SHORT_REQUEST_TIMEOUT_MS / 1000}s`;
   expect(await feedPass(opts(backlog), { ...t.deps, requestTimeoutMs: SHORT_REQUEST_TIMEOUT_MS })).toMatchObject({
-    failure: `no answer from the server in ${SHORT_REQUEST_TIMEOUT_MS / 1000}s`,
+    failure: why,
   });
+  expect(t.err[0]).toBe(
+    `[feed] line 1: the request for lane key a was cut off (${why}); its job may have been created`,
+  );
 });
 
 test("a looping feeder logs a failed pass and carries on until it is stopped", async () => {

@@ -275,6 +275,20 @@ test("a key given with the run means the template's own key is not read", () => 
   });
 });
 
+test("a template keyed on one bare argument is added; an all-digit value is refused with the fix", () => {
+  const bare = T("lane").replace("id: lane\n", "id: lane\nkey: ${PROJECT}\n");
+  expect(s.templateAdd(bare, null, "t").result).toBe("added");
+  expect(s.templateRun("lane", { PROJECT: "app" }, {}, "t").job).toBe("lane/app");
+  expect(() => s.templateRun("lane", { PROJECT: "42" }, {}, "t")).toThrow(
+    'key "42" is all digits, which are the numbers of unkeyed runs; prefix the key in template lane, as in key: run-${PROJECT}',
+  );
+  // A key the caller gives is the caller's to fix, not the template's.
+  expect(() => s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "7" })).toThrow(
+    /all digits, which are the numbers of unkeyed runs; give it a prefix, as in issue-1234$/,
+  );
+  expect(s.jobs().map((j) => j.id)).toEqual(["lane/app"]);
+});
+
 test("keyed refuses a run with no key; a key is never a run number", () => {
   s.templateAdd(T("lane"), null, "t");
   expect(() => s.templateRun("lane", {}, {}, "t", { keyed: true })).toThrow(SubmitError);
