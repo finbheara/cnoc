@@ -9,7 +9,9 @@ labels: { kind: maintenance }
 #
 # It leaves alone anything a process is working in or has open, worktrees with
 # uncommitted or untracked files, worktrees whose commits are on no branch, and
-# temp entries that hold a socket or whose name starts with a dot.
+# temp entries that hold a socket, hold a worktree this run kept, or whose name
+# starts with a dot. A temp entry is judged as a whole: one recent file inside
+# a directory keeps the directory.
 #
 #   cnoc template add examples/disk-cleanup.job
 #   cnoc template run disk-cleanup --set PROJECT=myapp --on HOST --set DRY_RUN=1
@@ -40,15 +42,18 @@ recent() { [ -n "$(find "$1" -mmin "-$2" 2>/dev/null | head -n 1)" ]; }
 size_kb() { du -sk "$1" 2>/dev/null | cut -f1; }
 
 wt_gone=0 wt_kept=0 tmp_gone=0 tmp_kept=0 freed_kb=0
+held=""   # worktrees that stay, one per line, so the temp pass does not delete one with its parent
 
-keep_wt() { wt_kept=$((wt_kept + 1)); echo "keep worktree $1: $2"; cnoc progress "kept worktree $1: $2"; }
+hold() { held="$held
+$real/"; }
+keep_wt() { hold; wt_kept=$((wt_kept + 1)); echo "keep worktree $1: $2"; cnoc progress "kept worktree $1: $2"; }
 worktrees=$(git worktree list --porcelain | sed -n 's/^worktree //p')
 while IFS= read -r w <&3; do
   [ -n "$w" ] || continue
   real=$(cd "$w" 2>/dev/null && pwd -P) || continue   # its directory is gone; prune below forgets it
   [ "$real" != "$main" ] || continue
   gitdir=$(git -C "$w" rev-parse --absolute-git-dir 2>/dev/null) || continue
-  if recent "$w" "$wt_min" || recent "$gitdir" "$wt_min"; then continue; fi   # not stale
+  if recent "$w" "$wt_min" || recent "$gitdir" "$wt_min"; then hold; continue; fi   # not stale
   if busy "$real"; then keep_wt "$w" "a process is using it"; continue; fi
   # --no-optional-locks: looking must not refresh the index, or the worktree would stop being stale
   if [ -n "$(git --no-optional-locks -C "$w" status --porcelain 2>/dev/null | head -n 1)" ]; then keep_wt "$w" "uncommitted or untracked files"; continue; fi
@@ -77,6 +82,9 @@ for e in "$tmp"/*; do
   if busy "$e" || [ -n "$(find "$e" \( -type s -o -type p \) 2>/dev/null | head -n 1)" ]; then
     tmp_kept=$((tmp_kept + 1)); echo "keep $e: in use"; continue
   fi
+  if printf '%s\n' "$held" | grep -qF -- "$e/"; then
+    tmp_kept=$((tmp_kept + 1)); echo "keep $e: holds a worktree that was kept"; continue
+  fi
   kb=$(size_kb "$e")
   if [ "$dry" = 1 ]; then echo "would remove $e"; else rm -rf -- "$e" && echo "removed $e" || continue; fi
   tmp_gone=$((tmp_gone + 1)); freed_kb=$((freed_kb + ${kb:-0}))
@@ -85,5 +93,5 @@ done
 [ "$tmp_gone" -eq 0 ] || cnoc progress "$tmp:$names$([ "$tmp_gone" -le 8 ] || echo " and $((tmp_gone - 8)) more")"
 
 verb=removed; [ "$dry" = 1 ] && verb="DRY RUN, would remove"
-cnoc done "$verb $wt_gone worktrees ($wt_kept stale but kept) and $tmp_gone entries in $tmp ($tmp_kept old but in use); $((freed_kb / 1024)) MB"
+cnoc done "$verb $wt_gone worktrees ($wt_kept stale but kept) and $tmp_gone entries in $tmp ($tmp_kept old but kept); $((freed_kb / 1024)) MB"
 END
