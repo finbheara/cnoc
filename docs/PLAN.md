@@ -4,7 +4,7 @@ What exists, what does not, and the order to build the rest. The design is in [S
 
 ## Built and tested
 
-Tested means covered by `bun test`: 103 tests of cnoc itself, 28 of them end to end with a real server, real clients and real tmux sessions, and 274 specs of the gate.
+Tested means covered by `bun test`: 155 tests of cnoc itself, 33 of them end to end with a real server, real clients and real tmux sessions, and 274 specs of the gate.
 
 | Area | What works |
 |---|---|
@@ -17,7 +17,7 @@ Tested means covered by `bun test`: 103 tests of cnoc itself, 28 of them end to 
 | Changelog | Numbered events, paging and long-poll, server-sent events, signed in-order webhooks, `/v1/state` snapshot. |
 | Updates | The version is the commit a process runs. A client on another version takes no work, checks out exactly the server's commit from its clone's `origin` and exits for its service manager; failures back off across restarts, and `cnoc hosts` shows each host's version and why it has not caught up. |
 | Git intake | `cnoc ingest` of a checkout's `jobs/` directory. |
-| Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. |
+| Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. Keyed runs (`--key`, or `key:` in the template) start once however often they are offered; `keyed` refuses a run with no key. |
 | When and where | `begin` (a time or a delay), `--on HOST` through a `host/NAME` feature, priority at submit and on a waiting job. |
 | Gate | `bun am-i-done`: one ordered list of checks with a deadline, modes for the git hooks, and output kept out of an agent's context. `bun doing-it-wrong`: a rule engine with fifteen rules, each with fixtures. CI runs the gate on Linux and macOS, and both jobs are required on `main`. |
 | Client install | `install.sh`: clone, `cnoc` command, config, and a systemd user unit or launchd agent that leaves tmux sessions alone on restart. |
@@ -46,7 +46,7 @@ In rough order of value.
 
 ### 2. Accounting
 
-- **Tokens and spend per attempt.** Nothing is collected yet. Options: an adapter `USAGE` step, the harness's own transcript, or a `mcx` adapter that already tracks it.
+- **Tokens per stage** are collected for Claude Code from the session's own transcript, when the agent runs `cnoc done`, `fail` or `handoff`, or from a `Stop` hook running `cnoc usage` (SPEC §5). Not yet: a collector for `codex`, prices or spend, totals per job or per host, and an incremental read (each call re-reads the whole transcript, bounded to a few seconds). Not exercised against a real Claude Code session through the client; the reader was checked against real transcripts on one machine.
 - **Per-job CPU and memory.** Only host-level load is measured.
 - **Budgets** that stop a job, and quota-aware admission for shared subscriptions. Pools cap concurrency today, not consumption.
 - **A stalled state** for a session waiting on a usage-limit reset. It currently just runs until its time limit.

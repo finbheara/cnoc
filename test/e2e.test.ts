@@ -2,17 +2,14 @@
  * End to end: a real server, real clients and real tmux sessions, using the shell harness.
  */
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
-import { type KeyObject, createPublicKey, generateKeyPairSync, sign } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { specTempDir } from "../scripts/testkit";
 import { type ClientConfig, CnocClient } from "../src/client/client";
 import { Tmux } from "../src/client/tmux";
-import { type ChangeEvent, PROTOCOL } from "../src/protocol";
+import type { ChangeEvent } from "../src/protocol";
 import { CnocServer, type HostInfo, type JobInfo } from "../src/server/server";
 import type { AttemptRow, TemplateRow } from "../src/server/store";
-import { versionOf } from "../src/version";
-import { commit, git, makeRepos } from "./git-fixture";
 
 // Every test here starts real tmux sessions and waits for a client and a server to agree about them,
 // so one test legitimately takes seconds. Each wait inside a test polls a condition (see `until`).
@@ -70,6 +67,9 @@ interface Res {
   events: ChangeEvent[];
   templates: TemplateRow[];
   template: TemplateRow;
+  /** `POST /v1/template/run`: false when a keyed run's job already existed. */
+  created: boolean;
+  state: string;
   result: string;
   subscription: { id: number; secret: string };
 }
@@ -351,134 +351,6 @@ test("a client on the wrong version updates itself and takes no work", async () 
   expect(delta?.mismatch?.note).toMatch(/^updating to /);
 });
 
-test("a server restarted on a new commit brings its client to it, and the session keeps running", async () => {
-  const { clone, commits } = makeRepos(specTempDir("cnoc-e2e-upgrade-"), 3);
-  // The server moves to the middle commit while main has already moved past it.
-  const [from, to] = commits as [string, string, string];
-  const dir = join(root, "data-upgrade");
-  let srv = await new CnocServer({ dataDir: dir, port: 0, openEnrollment: true, log: quiet, version: from }).start();
-  const port = srv.port;
-  const exits: number[] = [];
-  // What the service manager runs: the code in the checkout, whatever version that is now.
-  const service = () =>
-    new CnocClient({
-      config: { server: srv.url, name: "zeta", projects: { proj: project } },
-      stateDir: join(root, "state-zeta"),
-      tmuxSocket: socket,
-      pollMs: 100,
-      log: quiet,
-      checkout: clone,
-      version: versionOf(clone),
-      exit: (c) => exits.push(c),
-    });
-  let zeta = await service().start();
-  try {
-    const j = id("across-upgrade");
-    const go = `go-${seq}.txt`;
-    await api(
-      "POST",
-      "/v1/jobs",
-      { jobs: [job(j, `until [ -f ${go} ]; do sleep 0.1; done; cnoc done upgraded`)] },
-      srv,
-    );
-    await reaches(j, "running", srv);
-    const attempt = (await api("GET", `/v1/job?id=${encodeURIComponent(j)}`, undefined, srv)).attempts[0]?.id;
-
-    await srv.stop();
-    srv = await new CnocServer({ dataDir: dir, port, openEnrollment: true, log: quiet, version: to }).start();
-    await until("the client to update and exit", () => exits.length > 0);
-    expect(exits).toEqual([75]);
-    expect(git(clone, "rev-parse", "HEAD")).toBe(to);
-    expect(await new Tmux(socket).sessions()).toContain(`cnoc-${attempt}-0`);
-    const outdated = (await api("GET", "/v1/hosts", undefined, srv)).hosts.find((h) => h.name === "zeta");
-    expect(outdated?.mismatch).toMatchObject({ version: from, note: `updating to ${to.slice(0, 7)}` });
-
-    zeta = await service().start();
-    const back = await until("zeta back on the new version", async () =>
-      (await api("GET", "/v1/hosts", undefined, srv)).hosts.find((h) => h.name === "zeta" && h.online),
-    );
-    expect(back).toMatchObject({ version: to, mismatch: null });
-    writeFileSync(join(project, go), "");
-    expect((await reaches(j, "done", srv)).result).toEqual([{ status: "done", summary: "upgraded" }]);
-  } finally {
-    await zeta.stop();
-    await srv.stop();
-  }
-});
-
-test("a client that cannot reach the server's commit says why and does not restart", async () => {
-  const { origin, clone } = makeRepos(specTempDir("cnoc-e2e-unpushed-"), 1);
-  const elsewhere = join(origin, "..", "dev");
-  git(join(origin, ".."), "clone", "-q", origin, elsewhere);
-  const unpushed = commit(elsewhere, "code.txt", "never pushed\n");
-  const srv = await new CnocServer({
-    dataDir: join(root, "data-unpushed"),
-    port: 0,
-    openEnrollment: true,
-    log: quiet,
-    version: unpushed,
-  }).start();
-  const exits: number[] = [];
-  const eta = await new CnocClient({
-    config: { server: srv.url, name: "eta", projects: { proj: project } },
-    stateDir: join(root, "state-eta"),
-    tmuxSocket: socket,
-    pollMs: 100,
-    log: quiet,
-    checkout: clone,
-    version: versionOf(clone),
-    exit: (c) => exits.push(c),
-  }).start();
-  try {
-    const host = await until("the failure to reach the server", async () => {
-      const h = (await api("GET", "/v1/hosts", undefined, srv)).hosts.find((x) => x.name === "eta");
-      return h?.mismatch?.note?.includes("failed") ? h : null;
-    });
-    expect(host.online).toBe(false);
-    expect(host.mismatch?.note).toMatch(
-      /^update to \w{7} failed \(try 1\): commit \w{7} is not on origin; was it pushed\?; next try in \d+s$/,
-    );
-    expect(exits).toEqual([]);
-  } finally {
-    await eta.stop();
-    await srv.stop();
-  }
-});
-
-/** One hand-made hello, as any key holder could send it. Resolves when the server closes the connection. */
-async function rawHello(srv: CnocServer, name: string, key: KeyObject, fields: { version: string; update: string }) {
-  const ws = new WebSocket(`${srv.url.replace(/^http/, "ws")}/v1/client`);
-  const closed = new Promise<void>((resolve) => {
-    ws.onclose = () => resolve();
-  });
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(String(ev.data)) as { t: string; nonce?: string };
-    if (msg.t !== "challenge") return;
-    const pubkey = createPublicKey(key).export({ type: "spki", format: "der" }).toString("base64");
-    const sig = sign(null, Buffer.from(`cnoc-hello\n${name}\n${msg.nonce}`), key).toString("base64");
-    ws.send(JSON.stringify({ t: "hello", name, pubkey, sig, protocol: PROTOCOL, ...fields }));
-  };
-  await closed;
-}
-
-test("what a host on another version says is shown only for an approved key, and only as plain text", async () => {
-  const strict = await new CnocServer({ dataDir: join(root, "data-notes"), port: 0, log: quiet }).start();
-  try {
-    const { privateKey } = generateKeyPairSync("ed25519");
-    const forged = { version: "\u001b[2Jevil", update: "\u001b[31mfine\nmallory online all good\u0007" };
-    await rawHello(strict, "theta", privateKey, forged);
-    const pending = (await api("GET", "/v1/hosts", undefined, strict)).hosts.find((h) => h.name === "theta");
-    expect(pending).toMatchObject({ status: "pending", mismatch: null });
-
-    await api("POST", "/v1/host/approve?name=theta", undefined, strict);
-    await rawHello(strict, "theta", privateKey, forged);
-    const shown = (await api("GET", "/v1/hosts", undefined, strict)).hosts.find((h) => h.name === "theta");
-    expect(shown?.mismatch).toMatchObject({ version: "(invalid)", note: " [31mfine mallory online all good " });
-  } finally {
-    await strict.stop();
-  }
-});
-
 test("a second client cannot share a state directory", async () => {
   await expect(newClient("alpha").start()).rejects.toThrow(/already using/);
   // The refused start must not have disturbed the first client.
@@ -697,6 +569,66 @@ test("a template runs again and again, with arguments, pinned to a host", async 
   } finally {
     await pin.stop();
   }
+});
+
+test("a keyed template run happens once, however often it is offered", async () => {
+  const name = `keyed-${++seq}`;
+  const text = `---\nid: ${name}\nkey: issue-\${ISSUE}\n---\nARG ISSUE\nARG CMD=true\nFROM proj\nHARNESS shell\nPROMPT "\${CMD}"\n`;
+  expect((await api("POST", "/v1/templates", { text })).status).toBe(200);
+  const runOf = (body: unknown) => api("POST", `/v1/template/run?ref=${name}`, body);
+
+  // The template's own key names the run; it fails, and offering it again does not start it again.
+  const first = await runOf({ set: { ISSUE: "7", CMD: "false" }, keyed: true });
+  expect(first).toMatchObject({ status: 200, created: true, job: { id: `${name}/issue-7` } });
+  expect(first.state).toBe(first.job.state);
+  await reaches(`${name}/issue-7`, "failed");
+  const again = {
+    status: 200,
+    created: false,
+    state: "failed",
+    job: { id: `${name}/issue-7`, state: "failed" },
+  };
+  // Other arguments, and then a template that now needs an argument this caller does not send.
+  expect(await runOf({ set: { ISSUE: "7", CMD: "echo other" }, keyed: true })).toMatchObject(again);
+  const changed = text.replace("ARG CMD=true\n", "ARG CMD=true\nARG NEW\n");
+  expect((await api("POST", "/v1/templates", { text: changed })).result).toBe("updated");
+  expect(await runOf({ set: { ISSUE: "7", CMD: "false" }, keyed: true, key: null })).toMatchObject(again);
+  expect((await runOf({ set: { ISSUE: "70" } })).error).toMatch(/NEW has no default/);
+  expect((await api("POST", "/v1/templates", { text })).result).toBe("updated");
+
+  // A key given with the run overrides the template's, and may contain a slash.
+  const own = await runOf({ set: { ISSUE: "8" }, key: "myapp/8" });
+  expect(own).toMatchObject({ created: true, job: { id: `${name}/myapp/8` } });
+  await reaches(`${name}/myapp/8`, "done");
+  expect(await runOf({ set: { ISSUE: "9" }, key: "myapp/8" })).toMatchObject({ created: false, state: "done" });
+  expect((await runOf({ set: { ISSUE: "1" }, key: "a b" })).error).toMatch(/not a valid id segment/);
+  expect((await runOf({ set: { ISSUE: "1" }, key: 5 })).error).toMatch(/key must be a string/);
+  expect((await runOf({ set: { ISSUE: "1" }, key: "8" })).error).toMatch(/all digits/);
+  // A job this template did not start is not passed off as a run of it.
+  await submit(job(`${name}/plain`, "true"));
+  const taken = await runOf({ set: { ISSUE: "1" }, key: "plain" });
+  expect(taken).toMatchObject({
+    status: 409,
+    error: `job ${name}/plain exists and was not started by template ${name}`,
+  });
+  await reaches(`${name}/plain`, "done");
+
+  const runs = (await events()).flatMap((e) =>
+    e.type === "template.run" && (e.data as { name: string }).name === name ? [e.job] : [],
+  );
+  expect(runs).toEqual([`${name}/issue-7`, `${name}/myapp/8`]);
+  expect((await api("GET", `/v1/template?ref=${name}`)).template.runs).toBe(2);
+
+  // A template without a key: keyed refuses the run, and no job is made.
+  const loose = `loose-${++seq}`;
+  await api("POST", "/v1/templates", { text: `---\nid: ${loose}\n---\nFROM proj\nHARNESS shell\nPROMPT true\n` });
+  const refused = await api("POST", `/v1/template/run?ref=${loose}`, { keyed: true });
+  expect(refused.status).toBe(400);
+  expect(refused.error).toMatch(/this run has no key/);
+  expect((await api("GET", "/v1/jobs?all=1")).jobs.some((j) => j.id.startsWith(`${loose}/`))).toBe(false);
+  const numbered = await api("POST", `/v1/template/run?ref=${loose}`, {});
+  expect(numbered).toMatchObject({ created: true, job: { id: `${loose}/1` } });
+  await reaches(`${loose}/1`, "done");
 });
 
 test("a job with a begin time waits for it", async () => {

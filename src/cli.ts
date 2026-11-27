@@ -3,10 +3,12 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CnocClient, loadClientConfig } from "./client/client";
-import { JobfileError, checkTemplate, declaresArgs, parseJob } from "./jobfile";
+import { JobfileError, checkTemplate, isTemplate, parseJob } from "./jobfile";
 import { type ChangeEvent, type Overrides, PROTOCOL } from "./protocol";
+import { ReportError, parseHandoff, report, snapshot } from "./report";
 import { CnocServer, type HostInfo, type JobInfo, type ServerOptions } from "./server/server";
 import type { AttemptRow, TemplateRow } from "./server/store";
+import { formatUsage } from "./usage";
 import { printable, runningVersion, shortVersion } from "./version";
 
 const HELP = `cnoc - batch scheduling of agent harness sessions across persistent hosts
@@ -28,7 +30,7 @@ Templates (cnoc t is short for cnoc template)
   cnoc template add FILE...                save a Jobfile so it can be started again and again
   cnoc template list
   cnoc template show REF
-  cnoc template run REF [--set NAME=VALUE]... [WHEN AND WHERE]
+  cnoc template run REF [--set NAME=VALUE]... [--key KEY] [WHEN AND WHERE]
   cnoc template rm REF                     REF is the number, the name, or the file it was added from
 
 When and where, for submit and template run
@@ -49,6 +51,9 @@ Inside a job (the harness calls these)
   cnoc progress "note"
   cnoc done "summary"
   cnoc fail "reason"
+  cnoc handoff MERGED [-m "note"]          done, recording how the work was left
+  cnoc handoff BLOCKED -m "reason"         failed, recording how the work was left
+  cnoc usage                               record token usage so far without ending; for a Stop hook
 
 Connection: CNOC_URL and CNOC_TOKEN, or ~/.config/cnoc/cli.json { "url", "token" }.
 Inside a job the client's local socket is used and no credential is needed.`;
@@ -195,12 +200,6 @@ function printEvent(e: ChangeEvent): void {
   );
 }
 
-async function report(status: "done" | "failed", summary: string): Promise<void> {
-  if (!process.env.CNOC_SOCK) throw new CliError("not inside a Cnoc job (CNOC_SOCK is not set)");
-  const r = await api<{ accepted: boolean }>("POST", "/attempt/result", { status, summary });
-  console.log(r.accepted ? `reported ${status}` : "a result was already reported for this stage");
-}
-
 async function main(): Promise<void> {
   const [cmd = "help", ...rest] = process.argv.slice(2);
   const { pos, flags, sets } = parseArgs(rest);
@@ -258,7 +257,7 @@ async function main(): Promise<void> {
       for (const f of pos) {
         try {
           const text = readFileSync(f, "utf8");
-          if (declaresArgs(text)) {
+          if (isTemplate(text)) {
             const t = checkTemplate(text);
             const args = t.args.map((a) => (a.default === null ? a.name : `${a.name}=${a.default}`)).join(", ");
             console.log(`ok    ${f}  (template ${t.name}; arguments: ${args})`);
@@ -341,7 +340,14 @@ async function main(): Promise<void> {
             if (i < 1) throw new CliError(`--set takes NAME=VALUE, got ${kv}`);
             set[kv.slice(0, i)] = kv.slice(i + 1);
           }
-          const r = await api<OneJob>("POST", `/v1/template/run?${ref()}`, { set, overrides: overrides(flags) });
+          if (flags.key === true) throw new CliError("--key takes a value");
+          const key = typeof flags.key === "string" ? flags.key : undefined;
+          const r = await api<OneJob & { created: boolean }>("POST", `/v1/template/run?${ref()}`, {
+            set,
+            overrides: overrides(flags),
+            ...(key !== undefined ? { key } : {}),
+          });
+          if (!r.created) return console.log(`exists     ${r.job.id}  ${r.job.state}  (already run with this key)`);
           return console.log(`submitted  ${r.job.id}  ${r.job.state}${why(r.job) ? `  (${why(r.job)})` : ""}`);
         }
         case "rm":
@@ -421,7 +427,11 @@ async function main(): Promise<void> {
         console.log(
           `  attempt ${a.id} on ${a.host}: ${a.state}${a.outcome ? ` ${a.outcome}` : ""}${a.reason ? ` (${a.reason})` : ""}`,
         );
-      for (const [i, s] of (j.result ?? []).entries()) console.log(`  stage ${i + 1}: ${s.status}  ${s.summary}`);
+      for (const [i, s] of (j.result ?? []).entries()) {
+        const how = s.reported === false ? "no report" : `${s.status}${s.handoff ? `  handoff ${s.handoff}` : ""}`;
+        console.log(`  stage ${i + 1}: ${how}  ${s.summary}`);
+        if (s.usage) console.log(`    tokens: ${formatUsage(s.usage)}`);
+      }
       return;
     }
 
@@ -498,10 +508,19 @@ async function main(): Promise<void> {
       await api<unknown>("POST", "/attempt/progress", { note: pos.join(" ") });
       return;
     }
+    // Each exits once its report is answered: a transcript read given up at its time limit may leave a file open.
     case "done":
-      return report("done", pos.join(" "));
+      await report({ status: "done", summary: pos.join(" ") });
+      return process.exit(0);
     case "fail":
-      return report("failed", pos.join(" "));
+      await report({ status: "failed", summary: pos.join(" ") });
+      return process.exit(0);
+    case "handoff":
+      await report(parseHandoff(rest));
+      return process.exit(0);
+    case "usage":
+      await snapshot(rest.includes("--print"));
+      return process.exit(0);
 
     default:
       throw new CliError(`unknown command: ${cmd}\n\n${HELP}`);
@@ -509,7 +528,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  if (e instanceof CliError) console.error(`cnoc: ${e.message}`);
+  if (e instanceof CliError || e instanceof ReportError) console.error(`cnoc: ${e.message}`);
   else console.error(e);
   process.exit(1);
 });

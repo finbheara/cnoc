@@ -3,9 +3,23 @@
  * Every mutation appends at least one changelog event in the same transaction.
  */
 import { Database } from "bun:sqlite";
-import { JobfileError, type TemplateArg, checkTemplate, instantiate, parseBegin, parseJob } from "../jobfile";
+import { JobfileError, parseBegin, parseJob } from "../jobfile";
 import type { AttemptEnd, ChangeEvent, JobSpec, JobState, Measured, Overrides, Resources } from "../protocol";
 import { TERMINAL } from "../protocol";
+import { reportedFields } from "../report";
+import { SubmitError } from "./errors";
+import {
+  type RunOptions,
+  type TemplateRow,
+  addTemplate,
+  findTemplate,
+  listTemplates,
+  removeTemplate,
+  runTemplate,
+} from "./templates";
+
+export { SubmitError } from "./errors";
+export type { TemplateRow } from "./templates";
 
 export interface JobRow {
   id: string;
@@ -44,36 +58,12 @@ export interface HostRow {
   last_seen: number | null;
 }
 
-export interface TemplateRow {
-  id: number;
-  /** The id in the template's front matter. Instances are named `<name>/<n>`. */
-  name: string;
-  body: string;
-  args: TemplateArg[];
-  /** The file it was added from, as the submitter named it. */
-  source: string | null;
-  added_at: number;
-  updated_at: number;
-  runs: number;
-  last_run_at: number | null;
-  last_job: string | null;
-}
-
 export interface Subscription {
   id: number;
   url: string;
   types: string[];
   secret: string;
   cursor: number;
-}
-
-export class SubmitError extends Error {
-  constructor(
-    message: string,
-    readonly status = 400,
-  ) {
-    super(message);
-  }
 }
 
 type Raw = Record<string, unknown>;
@@ -316,9 +306,10 @@ export class Store {
     reason: string | null,
     result: unknown,
     actor?: string,
+    extra: object = {},
   ): void {
     this.setJob(id, state, reason, { result, cancel: 0 });
-    this.emit("job.terminal", { job: id, actor, data: { state, reason } });
+    this.emit("job.terminal", { job: id, actor, data: { state, reason, ...extra } });
     this.wake(id);
   }
 
@@ -374,119 +365,32 @@ export class Store {
     })();
   }
 
-  // ---- templates -----------------------------------------------------------
-
-  private templateRow(r: Raw | null): TemplateRow | null {
-    if (!r) return null;
-    const body = r.body as string;
-    let args: TemplateArg[] = [];
-    try {
-      args = checkTemplate(body).args;
-    } catch {
-      // A template stored by an older version may no longer parse; it still lists and can be removed.
-    }
-    return { ...(r as unknown as TemplateRow), body, args };
-  }
+  // ---- templates (src/server/templates.ts) ----------------------------------
 
   templates(): TemplateRow[] {
-    return (this.db.query("SELECT * FROM templates ORDER BY id").all() as Raw[]).map(
-      (r) => this.templateRow(r) as TemplateRow,
-    );
+    return listTemplates(this);
   }
 
-  /** Finds a template by number, by name, or by the file it was added from. */
   template(ref: string, path?: string): TemplateRow | null {
-    const q = (sql: string, v: string | number) => this.templateRow(this.db.query(sql).get(v) as Raw | null);
-    return (
-      (/^\d+$/.test(ref) ? q("SELECT * FROM templates WHERE id = ?", Number(ref)) : null) ??
-      q("SELECT * FROM templates WHERE name = ?", ref) ??
-      q("SELECT * FROM templates WHERE source = ?", ref) ??
-      (path ? q("SELECT * FROM templates WHERE source = ?", path) : null)
-    );
+    return findTemplate(this, ref, path);
   }
 
-  /** Saves a template. Adding the same name again replaces its content and keeps its number. */
-  templateAdd(
-    body: string,
-    source: string | null,
-    actor: string,
-  ): { template: TemplateRow; result: "added" | "updated" | "unchanged" } {
-    let name: string;
-    try {
-      name = checkTemplate(body).name;
-    } catch (e) {
-      if (e instanceof JobfileError) throw new SubmitError(e.message);
-      throw e;
-    }
-    return this.db.transaction(() => {
-      const have = this.template(name);
-      const now = Date.now();
-      let result: "added" | "updated" | "unchanged" = "unchanged";
-      if (!have) {
-        this.db.run("INSERT INTO templates(name, body, source, added_at, updated_at) VALUES(?,?,?,?,?)", [
-          name,
-          body,
-          source,
-          now,
-          now,
-        ]);
-        result = "added";
-      } else if (have.body !== body) {
-        this.db.run("UPDATE templates SET body = ?, source = ?, updated_at = ? WHERE id = ?", [
-          body,
-          source ?? have.source,
-          now,
-          have.id,
-        ]);
-        result = "updated";
-      }
-      const template = this.template(name) as TemplateRow;
-      if (result !== "unchanged") this.emit(`template.${result}`, { actor, data: { template: template.id, name } });
-      return { template, result };
-    })();
+  templateAdd(body: string, source: string | null, actor: string): ReturnType<typeof addTemplate> {
+    return addTemplate(this, body, source, actor);
   }
 
   templateRemove(ref: string, path: string | undefined, actor: string): TemplateRow {
-    const t = this.template(ref, path);
-    if (!t) throw new SubmitError(`no such template: ${ref}`, 404);
-    this.db.run("DELETE FROM templates WHERE id = ?", [t.id]);
-    this.emit("template.removed", { actor, data: { template: t.id, name: t.name } });
-    return t;
+    return removeTemplate(this, ref, path, actor);
   }
 
-  /** Submits a new job made from a template. Jobs it started earlier are not affected by later edits. */
   templateRun(
     ref: string,
     set: Record<string, string>,
     over: Overrides,
     actor: string,
-  ): { template: TemplateRow; job: string } {
-    return this.db.transaction(() => {
-      const t = this.template(ref);
-      if (!t) throw new SubmitError(`no such template: ${ref}`, 404);
-      // The counter is kept by name and outlives the template, so a removed and re-added
-      // template never reuses a job id.
-      const key = `template-runs:${t.name}`;
-      let n = Number(this.meta(key) ?? 0) + 1;
-      while (this.job(`${t.name}/${n}`)) n++;
-      this.meta(key, String(n));
-      const job = `${t.name}/${n}`;
-      let text: string;
-      try {
-        text = instantiate(t.body, set, job);
-      } catch (e) {
-        if (e instanceof JobfileError) throw new SubmitError(e.message);
-        throw e;
-      }
-      this.submit([text], actor, over, { template: t.name });
-      this.db.run("UPDATE templates SET runs = runs + 1, last_run_at = ?, last_job = ? WHERE id = ?", [
-        Date.now(),
-        job,
-        t.id,
-      ]);
-      this.emit("template.run", { job, actor, data: { template: t.id, name: t.name, set } });
-      return { template: this.template(String(t.id)) as TemplateRow, job };
-    })();
+    opts?: RunOptions,
+  ): ReturnType<typeof runTemplate> {
+    return runTemplate(this, ref, set, over, actor, opts);
   }
 
   // ---- attempts ------------------------------------------------------------
@@ -587,13 +491,14 @@ export class Store {
         "UPDATE attempts SET state = 'ended', outcome = ?, reason = ?, ended_at = ?, result = ? WHERE id = ?",
         [end.outcome, end.reason, Date.now(), json(end.results), a.id],
       );
+      const { handoff, usage } = reportedFields(end.results, end.outcome);
       this.emit("attempt.ended", {
         job: a.job,
         attempt: a.id,
         host,
-        data: { outcome: end.outcome, reason: end.reason },
+        data: { outcome: end.outcome, reason: end.reason, ...handoff, ...usage },
       });
-      this.finish(a.job, end.outcome, end.reason, end.results);
+      this.finish(a.job, end.outcome, end.reason, end.results, undefined, handoff);
       return "ok";
     })();
   }

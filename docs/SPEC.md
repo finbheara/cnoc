@@ -60,6 +60,7 @@ A Jobfile is YAML front matter followed by one instruction per line, in the Dock
 | `time` | no | Wall-clock limit for the whole job (`90s`, `30m`, `4h`, `1d2h`). |
 | `begin` | no | The job may not start before this. A time with a zone (`2027-01-31T03:00:00Z`), or `+duration` counted from submission. A time without a zone is an error. |
 | `labels` | no | Free-form map. Ignored by Cnoc. |
+| `key` | no | Templates only (3.5): names each run `<id>/<key>`, so a run with the same key is started once. An error in a plain Jobfile. |
 
 An unknown key is an error.
 
@@ -96,10 +97,13 @@ A template is a Jobfile stored on the server so it can be started repeatedly.
 
 - `ARG NAME` or `ARG NAME=default` declares an argument; names are capitals, digits and underscores. `ARG` is an error in a plain job.
 - Starting a template replaces `${NAME}` for every declared argument throughout the text, front matter included, and removes the `ARG` lines. Undeclared names are left alone. An argument with no default must be supplied; an unknown argument is an error.
-- The template's `id` is its name and may not contain an argument. Each run is submitted as the job `<name>/<n>`. The counter belongs to the name and survives removal of the template, so job ids are never reused.
+- The template's `id` is its name and may not contain an argument. Each run is submitted as the job `<name>/<n>`. The counter belongs to the name and survives removal of the template, so job ids are never reused, and it skips any id that already exists.
+- A run may have a key. It comes from the run request, or else from the template's `key:` front matter line, which is filled from the arguments like the rest of the text (`key: ${PROJECT}-${ISSUE}`). A keyed run is the job `<name>/<key>`. The key may contain `/` and must match `[A-Za-z0-9._#-]+(/[A-Za-z0-9._#-]+)*`, and the whole id must be a valid id. A segment may not be `.` or `..`, and the key may not be all digits: those ids are the numbered runs, so a keyed run and a numbered one never share an id. The line is read as the template writes it, before arguments are filled in: a bare value is taken literally, not as a YAML number (`0x7` stays `0x7`), up to a ` #` comment as YAML would; a quoted value is read as a YAML string. A `#` or a quote in an argument's value is part of the key, and is refused as not a valid id segment. A key given with the run replaces the declared one entirely; the declared one is not read. `key` is an error in a plain Jobfile, and the `key:` line is removed from the job a run creates.
+- A keyed run whose job already exists is a no-op, in any state of that job and whatever the arguments or the template now say: no job, no event, no count. To make that hold for a declared key, only the `key:` line is filled (from the arguments given and the defaults) to find the job; the rest of the template is filled only for a new run. A failed or cancelled run is run again with requeue. This makes a run safe to offer repeatedly, like a submission (3.3).
+- A job by that id that the template did not start (a plain submission, or a run of another template whose name makes the same id) is not taken for the run: the request is refused with 409.
 - A run is an ordinary job: its text is the filled-in template and does not change if the template does. It carries the label `template: <name>`.
 - Adding a template whose name exists replaces its text and keeps its number. A template is found by number, by name, or by the path of the file it was added from.
-- A template is validated when added, with `1` standing in for arguments that have no default.
+- A template is validated when added, with `1` standing in for arguments that have no default. That includes its key.
 
 ## 4. Adapters
 
@@ -127,14 +131,38 @@ Sessions run under `/bin/sh` on a dedicated tmux socket named `cnoc`, with the c
 Each session has on its `PATH`:
 
 ```
-cnoc progress "note"      # a changelog event; best effort
-cnoc done "summary"       # the stage succeeded
-cnoc fail "reason"        # the stage failed
+cnoc progress "note"                # a changelog event; best effort
+cnoc done "summary"                 # the stage succeeded
+cnoc fail "reason"                  # the stage failed
+cnoc handoff MERGED [-m "note"]     # succeeded, and says how the work was left
+cnoc handoff BLOCKED -m "reason"    # failed, the same way; the message is required
+cnoc usage                          # record token usage so far; does not end the stage
 ```
 
-- The first `done` or `fail` for a stage wins; later ones are ignored.
+- The first `done`, `fail` or `handoff` for a stage wins; later ones are ignored.
 - A stage that ends with no report is `failed` with reason `no-result`.
 - A project may call these from a stop hook so a result is reported even when the agent forgets.
+- The instructions appended to a prompt (`${REPORT}`) tell the agent to use the closing command its prompt names, and `done` or `fail` only if it names none.
+
+**Handoff.** The status is read in any case and stored upper case in the stage result's `handoff` field. The set is fixed in the code (`MERGED` → `done`, `BLOCKED` → `failed`); anything else is refused with the list. It is not the `blocked` job state.
+
+**Usage.** `done`, `fail` and `handoff` attach the calling session's token usage to the result when they can read it. A collector per harness finds the session; only Claude Code has one. It takes the session id from `CLAUDE_CODE_SESSION_ID`, reads `<config>/projects/*/<id>.jsonl` (config is `$CLAUDE_CONFIG_DIR` or `~/.claude`) and every `*.jsonl` under `<id>/subagents/`, as a stream with a time limit. Claude Code writes a line per content block and repeats the response's usage on each under one `message.id`, with a smaller `output_tokens` on early blocks and not always in order; each id is counted once, at the largest value of each count, across all of the session's files. Lines that are not `assistant` entries with usage, and entries whose counts are all zero, are ignored.
+
+```
+usage: { harness, session, responses, at,
+         tokens:   { input, output, cache_creation, cache_read },
+         by_model: { <model>: { input, output, cache_creation, cache_read } },
+         partial?: "why the numbers are a lower bound" }
+```
+
+- No session, no transcript, a main transcript that is not a regular readable file means no `usage`; the result is never refused for it. A time limit, an unreadable subagent file or an unparseable line that carried usage gives `partial`. Symbolic links under `subagents/` are not followed, and the search goes four levels deep.
+- The read checks its time limit between chunks, and the whole collection is raced against the limit plus half a second, so a read that never returns (a FIFO, a hung mount) gives no usage and the report still goes out. Each call to the client's socket has a 10-second timeout.
+- `cnoc usage` is for a Claude Code `Stop` hook: it takes `session_id` and `transcript_path` from the hook's JSON on stdin when present, is silent and always exits 0. The client keeps the latest snapshot per stage.
+- Every session command sends the stage it was started under (`CNOC_STAGE`); the client refuses a report, and drops a snapshot, from a stage that is over.
+- When a report carries usage and a snapshot exists too, the stage keeps the report's if the snapshot is of another session. Otherwise a partial reading is a lower bound: a complete one is kept only if it counted at least as many responses, else the one that counted more; on a tie, the report's.
+- A stage that ends with no report (no result, time limit, cancel, launch failure) but has a snapshot gets the result `{ status: "failed", summary: <reason>, reported: false, usage }`. **An entry with `reported: false` is not a report:** it exists only to carry the usage, its `status` is always `failed` whatever the attempt's outcome (a cancelled attempt included), and a consumer must check `reported` before reading `status` or `summary` as the agent's word. `cnoc show` prints it as `no report`.
+- The client checks usage from the socket before passing it on: counts, `responses` and `at` must be non-negative integers, names at most 200 characters, at most 32 models (the reader counts any beyond 31 together as `(other)`); what does not conform is dropped.
+- A session never inherits a harness session variable (`CLAUDE_CODE_SESSION_ID`) from the client or from the tmux server's global environment: it is set empty. A job's `ENV` may set one.
 - The commands talk to the client over a local socket using a per-attempt token. A job holds no server credential.
 - The same socket forwards server API calls, so a job can submit follow-up jobs. They are recorded as submitted by the host.
 
@@ -192,7 +220,7 @@ One WebSocket per host, JSON messages, opened by the client at `/v1/client`.
 | client → server | `decline` | The host will not run it, with a reason. |
 | client → server | `started` | The first session exists. |
 | client → server | `progress` | A note from the harness. |
-| client → server | `ended` | Outcome, reason and per-stage results. |
+| client → server | `ended` | Outcome, reason and per-stage results, each with its optional `handoff` and `usage` (§5). |
 | server → client | `ack` | The `ended` was recorded. |
 | server → client | `cancel` | Stop this attempt. |
 
@@ -247,7 +275,7 @@ Bearer token on every call except health. The admin token may do everything. A h
 |---|---|
 | `POST /v1/jobs` | Submit. Body is one Jobfile as text, or `{ "jobs": [text...], "overrides"?: { on, priority, begin } }` as an atomic batch. |
 | `GET /v1/jobs` | Non-terminal jobs. `?all=1`, `?state=a,b`, `?project=`. |
-| `GET /v1/job?id=` | One job with its text and attempts. |
+| `GET /v1/job?id=` | One job with its text and attempts. Each stage in `result` may carry `handoff` and `usage` (§5). |
 | `POST /v1/job/cancel?id=` | Cancel. Immediate before start; a request to the host after. |
 | `POST /v1/job/requeue?id=` | Run a failed or cancelled job again. |
 | `POST /v1/job/abandon?id=` | Admin. Give up on a running job whose host is offline. |
@@ -256,7 +284,7 @@ Bearer token on every call except health. The admin token may do everything. A h
 | `POST /v1/templates` | Admin. Add or replace: `{ "text", "source"? }`. |
 | `GET /v1/template?ref=` | One template with its text. `ref` is a number, a name or a source path. |
 | `DELETE /v1/template?ref=` | Admin. Remove. Jobs it started are unaffected. |
-| `POST /v1/template/run?ref=` | Start a job: `{ "set"?: { NAME: value }, "overrides"? }`. |
+| `POST /v1/template/run?ref=` | Start a job: `{ "set"?: { NAME: value }, "overrides"?, "key"?: string, "keyed"?: boolean }`. A `key` of null is the same as none. `keyed: true` refuses (400) a run that has no key from the request or the template; a key whose id belongs to a job the template did not start is refused with 409. Answers `{ job, template, created, state, seq }`; `created` is false when a keyed run's job already existed, and `state` is the job's state. |
 | `GET /v1/hosts` | The server's `version`, and hosts with capacity, reserved counts, load, running attempts, the version each last connected with, and `mismatch` (version, note, time) for a host last refused for its version. |
 | `POST /v1/host/approve?name=` | Admin. Approve a pending key. |
 | `POST /v1/host/drain?name=&on=1\|0` | Admin. Stop or resume placing work on a host. |
@@ -281,9 +309,9 @@ Each event is `{ seq, ts, type, job, attempt, host, actor, data }`. `seq` increa
 | `job.requeued` | A terminal job was sent round again. |
 | `job.priority` | A waiting job's priority was changed. |
 | `template.added`, `.updated`, `.removed` | A template changed. |
-| `template.run` | A template started a job; the event names the job and the arguments. |
-| `job.terminal` | The job is `done`, `failed` or `cancelled`. |
-| `attempt.assigned`, `.returned`, `.started`, `.progress`, `.ended` | The life of one attempt. |
+| `template.run` | A template started a job; the event names the job, the arguments and the key, if any. A keyed run that changed nothing has no event. |
+| `job.terminal` | The job is `done`, `failed` or `cancelled`. Data: `state`, `reason`, and `handoff` when the stage that ended the attempt reported one and its outcome is the attempt's (never an earlier stage's). |
+| `attempt.assigned`, `.returned`, `.started`, `.progress`, `.ended` | The life of one attempt. `.ended` data: `outcome`, `reason`, `handoff` as above, and `usage`, one entry per stage result (null where none), when any stage has usage. |
 | `attempt.late_report` | A result arrived for an attempt that was no longer open. It is not applied. |
 | `host.pending`, `.approved`, `.online`, `.offline`, `.drained`, `.undrained` | Host lifecycle. |
 

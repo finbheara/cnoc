@@ -56,6 +56,34 @@ export interface StageResult {
   status: "done" | "failed";
   summary: string;
   data?: unknown;
+  /** How the agent left the work, from `cnoc handoff STATUS`: upper case, such as MERGED or BLOCKED. */
+  handoff?: string;
+  /** Tokens the harness session used, read from its transcript. */
+  usage?: Usage;
+  /** false: the stage ended without a report, and this entry exists only to carry its last usage snapshot. */
+  reported?: false;
+}
+
+export interface TokenCounts {
+  input: number;
+  output: number;
+  cache_creation: number;
+  cache_read: number;
+}
+
+/** What one harness session used, as its own transcript records it. Tokens only, no prices. */
+export interface Usage {
+  /** The collector that read it, named after the harness: `claude`. */
+  harness: string;
+  session: string;
+  tokens: TokenCounts;
+  by_model: Record<string, TokenCounts>;
+  /** Model responses counted, after de-duplication. */
+  responses: number;
+  /** When the transcript was read, epoch milliseconds. */
+  at: number;
+  /** Set when the numbers are a lower bound, saying why (a time limit, an unreadable file). */
+  partial?: string;
 }
 
 export interface AttemptEnd {
