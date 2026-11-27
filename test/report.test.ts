@@ -264,9 +264,14 @@ test("cnoc done tells the agent once that it is waiting for the client", async (
   expect(lines).toHaveLength(2);
   expect(lines[0]).toContain("may be restarting");
   expect(lines[1]).toStartWith(`cnoc: cannot reach ${env.CNOC_SOCK}`);
+  // `cnoc progress` is disposable: one try, no waiting, whatever the budget.
+  const { CNOC_REPORT_WAIT_MS: _, ...unlimited } = env;
+  const note = await cli(["progress", "step"], unlimited);
+  expect(note.code).toBe(1);
+  expect(note.err).toStartWith(`cnoc: cannot reach ${env.CNOC_SOCK}`);
+  expect(note.err.trim().split("\n")).toHaveLength(1);
   // `cnoc usage` runs from a hook on every turn: it never waits and never speaks.
-  const { CNOC_REPORT_WAIT_MS: _, ...noLimit } = env;
-  expect(await cli(["usage"], noLimit)).toEqual({ out: "", err: "", code: 0 });
+  expect(await cli(["usage"], unlimited)).toEqual({ out: "", err: "", code: 0 });
 });
 
 test("cnoc handoff refuses a bad status before it looks for a job", async () => {

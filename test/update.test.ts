@@ -346,6 +346,11 @@ test("any number of new deploys in an hour goes through", async () => {
   const clock = { t: 1_000_000 };
   expect(await restartsOnto(clone, state, clock, commits.slice(1), 5 * 60_000)).toEqual(Array(n).fill(true));
   expect(head(clone)).toBe(commits[n] as string);
+  // The previous version counts `restarts` against its own limit: new deploys are not written there,
+  // so a host downgraded to it is not held by them.
+  const { u } = updater(clone, state, clock, { version: versionOf(clone) });
+  expect(u.state()?.restarts).toEqual([]);
+  expect(u.state()?.returns).toEqual([]);
 });
 
 test("a server flapping between versions is held once returns reach the limit, for exactly as long as it says", async () => {
@@ -374,7 +379,9 @@ test("a server flapping between versions is held once returns reach the limit, f
   clock.t -= 10 * 3_600_000; // the clock jumps back: the hold is still bounded by the window
   expect(u.dueIn(next)).toBe(UPDATE_RESTART_WINDOW_MS);
   clock.t = now;
-  expect(u.note(next)).toEndWith("next try in 59m");
+  expect(u.note(next)).toBe(
+    `holding the update to ${shortVersion(next)}: ${UPDATE_RESTART_LIMIT} restarts in the last hour went back to a version this client had already run; is the server's version changing back and forth?; next try in 59m`,
+  );
 
   // A version the client has not run goes through while the flap is held.
   const { u: other } = updater(clone, state, clock, { version: versionOf(clone) });
@@ -384,7 +391,8 @@ test("a server flapping between versions is held once returns reach the limit, f
   const { u: agreed } = updater(clone, state, clock, { version: versionOf(clone) });
   agreed.clear();
   expect(agreed.state()?.returns).toHaveLength(UPDATE_RESTART_LIMIT);
-  expect(agreed.state()?.restarts).toHaveLength(flips.length + 1);
+  // Only the returns are in the previous version's field.
+  expect(agreed.state()?.restarts).toEqual(agreed.state()?.returns);
 
   // Once the oldest return is out of the window, going back is allowed again.
   clock.t = t0 + 2 * step + UPDATE_RESTART_WINDOW_MS;
@@ -423,13 +431,16 @@ test("a record the previous version wrote is read without its restarts counting,
   const onDisk = JSON.parse(readFileSync(join(state, "update.json"), "utf8"));
   expect(onDisk).toMatchObject({ target: commits[2], tries: 1, restarted: true, reason: null });
   expect(typeof onDisk.next_at).toBe("number");
-  expect(onDisk.restarts).toHaveLength(6);
+  // The old restarts are carried forward; this new deploy is not added to them.
+  expect(onDisk.restarts).toHaveLength(5);
   expect(onDisk.restarts.every((t: unknown) => typeof t === "number")).toBe(true);
 
   // A hold the old code made for its restart limit is dropped: the target is tried at once.
   old({ reason: "5 restarts for updates in the last hour; is the server's version changing back and forth?" });
   const held = updater(clone, state, clock, { version: commits[0] as string });
   expect(held.u.dueIn(commits[1] as string)).toBe(0);
+  // Nothing was restarted for that target, and nothing failed: the hello says only that it is updating.
+  expect(held.u.note(commits[1] as string)).toBe(`updating to ${shortVersion(commits[1])}`);
   // Any other backoff it recorded is honoured as it was.
   old({ reason: "commit 0123456 is not on origin; was it pushed?" });
   expect(updater(clone, state, clock).u.dueIn(commits[1] as string)).toBe(20 * 60_000);

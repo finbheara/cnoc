@@ -265,11 +265,16 @@ test("a server downgraded under a running feeder gets no job from it, and the fe
   const f = fake({
     health: async () => (downgraded ? { ok: true, version: "0.1.0" } : { ok: true, features: ["keyed-runs"] }),
   });
+  // Bounded, so a feeder that never notices the downgrade ends with 0 instead of looping.
+  const stop = new AbortController();
+  let passes = 0;
   const log = (l: string) => {
-    if (l.startsWith("[feed] pass:")) downgraded = true;
+    if (!l.startsWith("[feed] pass:")) return;
+    downgraded = true;
+    if (++passes === 3) stop.abort();
   };
   const backlog = source([line({ template: "lane", key: "a" })]);
-  expect(await feed(opts(backlog, { everyS: 0 }), { ...f.deps, log })).toBe(EXIT_FATAL);
+  expect(await feed(opts(backlog, { everyS: 0 }), { ...f.deps, log, signal: stop.signal })).toBe(EXIT_FATAL);
   // The first pass created the job; the second, against the older server, sent nothing.
   expect(f.calls.length).toBe(1);
   expect(f.healthChecks()).toBe(2);

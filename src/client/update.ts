@@ -57,8 +57,10 @@ export interface UpdateState {
   restarted: boolean;
   at: number;
   /**
-   * When recent tries ended in a restart, for any target. Kept as the previous version wrote it,
-   * so that a client downgraded to it still has its history; this version does not count it.
+   * The previous version's restart history, which it counts against its own limit of 5 an hour.
+   * This version writes only returns into it (the same times as `returns`), so a client downgraded
+   * to the previous version keeps its flap guard but is not held by a day of new deploys. This
+   * version does not read it, except to carry it forward.
    */
   restarts?: number[];
   /** The version each recent restart left, and when. Absent in a record the previous version wrote. */
@@ -75,12 +77,14 @@ const LEGACY_HOLD = /restarts for updates in the last hour/;
 /**
  * A record as this version reads it. One written by the previous version has no `left`: its
  * restarts name no versions, so none of them counts as a return, and a hold it made for its
- * restart limit (which counted new deploys too) is dropped, so the target is tried at once.
+ * restart limit (which counted new deploys too) is dropped, so the target is tried at once as if new.
  */
 export function readState(raw: UpdateState): UpdateState {
   if (Array.isArray(raw.left)) return raw;
   const legacyHold = typeof raw.reason === "string" && LEGACY_HOLD.test(raw.reason);
-  return { ...raw, left: [], returns: [], ...(legacyHold ? { next_at: 0, reason: null } : {}) };
+  // A dropped hold starts its target afresh: no tries, and no restart this version can vouch for.
+  const fresh = legacyHold ? { tries: 0, next_at: 0, reason: null, restarted: false } : {};
+  return { ...raw, left: [], returns: [], ...fresh };
 }
 
 export class UpdateError extends Error {}
@@ -184,10 +188,14 @@ export class Updater {
   /** One line for the server about what this client is doing to reach `target`. */
   note(target: string): string {
     const s = this.state();
-    if (this.busy || !s || s.target !== target) return `updating to ${short(target)}`;
+    const updating = `updating to ${short(target)}`;
+    if (this.busy || !s || s.target !== target) return updating;
     const next = `next try in ${duration(this.dueIn(target))}`;
+    if (s.held) return `holding the update to ${short(target)}: ${s.reason}; ${next}`;
     if (s.reason) return `update to ${short(target)} failed (try ${s.tries}): ${s.reason}; ${next}`;
-    return `restarted for ${short(target)} but still runs ${short(this.o.version)}; ${next}`;
+    // Only a try that ended in a restart may be described as one; a dropped hold, say, did not.
+    if (s.restarted) return `restarted for ${short(target)} but still runs ${short(this.o.version)}; ${next}`;
+    return updating;
   }
 
   /**
@@ -256,7 +264,7 @@ export class Updater {
       at: now,
       ...(restart
         ? {
-            restarts: [...h.restarts, now],
+            restarts: back ? [...h.restarts, now] : h.restarts,
             left: [...h.left, { version: this.o.version, at: now }],
             returns: back ? [...h.returns, now] : h.returns,
           }

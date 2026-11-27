@@ -168,7 +168,7 @@ cnoc handoff BLOCKED -m "review asked for a redesign"   # failed; the message is
 
 The built-in adapters append these instructions to the prompt, worded so that a prompt naming its own closing command (`… then run cnoc handoff MERGED`) is followed instead. A session that ends without reporting is `failed` with reason `no-result`.
 
-If the client is restarting (it does that to update itself), `done`, `fail` and `handoff` say so once on stderr and keep trying for up to 90 seconds, so finished work is not lost; `progress` waits up to 15 seconds.
+If the client is restarting (it does that to update itself), `done`, `fail` and `handoff` say so once on stderr and keep trying for up to 90 seconds, so finished work is not lost. `progress` is tried once, as before.
 
 `handoff` takes `MERGED` or `BLOCKED` in any case. The status is stored as its own `handoff` field on the stage's result and in the `attempt.ended` and `job.terminal` events, so a subscriber can tell an agent that handed the work back blocked from a session that crashed without reading the text. It is unrelated to the `blocked` job state, which means waiting on a dependency.
 

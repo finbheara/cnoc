@@ -91,8 +91,6 @@ export function reportedFields(
 
 /** How long `cnoc done`, `fail` and `handoff` keep trying to reach a client that is not answering: a restart for an update takes about 10 seconds. */
 export const REPORT_RETRY_MS = 90_000;
-/** How long `cnoc progress` keeps trying. A note is best effort, so it waits out a quick restart and no more. */
-export const PROGRESS_RETRY_MS = 15_000;
 /** The pause between two tries to reach the client. */
 export const RETRY_EVERY_MS = 1_500;
 /** Lowers every retry budget, in milliseconds (0: no retry). For tests, and for anyone who would rather fail at once. */
@@ -190,9 +188,12 @@ export async function report(result: Pick<StageResult, "status" | "summary" | "h
   console.log(r.accepted ? `reported ${what}` : "a result was already reported for this stage");
 }
 
-/** `cnoc progress`: a note for the changelog. Best effort, so it waits only briefly for a client that is restarting. */
+/**
+ * `cnoc progress`: a note for the changelog. Best effort and disposable, so it is tried once: a
+ * session calling it in a loop with no client answering must not stall on each call.
+ */
 export async function progress(note: string): Promise<void> {
-  await local("/attempt/progress", { note }, { ms: retryBudget(PROGRESS_RETRY_MS), waiting: toStderr });
+  await local("/attempt/progress", { note });
 }
 
 const stage = (): { stage?: number } => {
