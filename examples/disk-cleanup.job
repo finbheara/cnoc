@@ -1,0 +1,89 @@
+---
+id: disk-cleanup
+time: 30m
+labels: { kind: maintenance }
+---
+# A template. Frees disk on one host:
+#   - removes a project's git worktrees that nothing has touched for WORKTREE_HOURS
+#   - removes your entries in TMP that nothing has touched for TMP_HOURS
+#
+# It leaves alone anything a process is working in or has open, worktrees with
+# uncommitted or untracked files, worktrees whose commits are on no branch, and
+# temp entries that hold a socket or whose name starts with a dot.
+#
+#   cnoc template add examples/disk-cleanup.job
+#   cnoc template run disk-cleanup --set PROJECT=myapp --on HOST --set DRY_RUN=1
+#   cnoc template run disk-cleanup --set PROJECT=myapp --on HOST
+ARG PROJECT
+ARG WORKTREE_HOURS=12
+ARG TMP_HOURS=6
+ARG TMP=/tmp
+ARG DRY_RUN=0
+FROM ${PROJECT}
+HARNESS shell
+PROMPT <<END
+dry=${DRY_RUN}
+wt_min=$((${WORKTREE_HOURS} * 60))
+tmp_min=$((${TMP_HOURS} * 60))
+tmp=$(cd "${TMP}" 2>/dev/null && pwd -P) || { cnoc fail "no such directory: ${TMP}"; exit 1; }
+main=$(git rev-parse --show-toplevel 2>/dev/null) || { cnoc fail "$(pwd) is not a git checkout"; exit 1; }
+main=$(cd "$main" && pwd -P)
+
+# Every directory a process of this user is working in and every file one has open.
+if [ -d /proc/self/fd ]; then
+  inuse=$(find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l/\n' 2>/dev/null | grep '^/' | sort -u)
+else
+  inuse=$(lsof -Fn 2>/dev/null | sed -n 's|^n\(/.*\)$|\1/|p' | sort -u)
+fi
+busy() { printf '%s\n' "$inuse" | grep -qF -- "$1/"; }
+recent() { [ -n "$(find "$1" -mmin "-$2" 2>/dev/null | head -n 1)" ]; }
+size_kb() { du -sk "$1" 2>/dev/null | cut -f1; }
+
+wt_gone=0 wt_kept=0 tmp_gone=0 tmp_kept=0 freed_kb=0
+
+keep_wt() { wt_kept=$((wt_kept + 1)); echo "keep worktree $1: $2"; cnoc progress "kept worktree $1: $2"; }
+worktrees=$(git worktree list --porcelain | sed -n 's/^worktree //p')
+while IFS= read -r w <&3; do
+  [ -n "$w" ] || continue
+  real=$(cd "$w" 2>/dev/null && pwd -P) || continue   # its directory is gone; prune below forgets it
+  [ "$real" != "$main" ] || continue
+  gitdir=$(git -C "$w" rev-parse --absolute-git-dir 2>/dev/null) || continue
+  if recent "$w" "$wt_min" || recent "$gitdir" "$wt_min"; then continue; fi   # not stale
+  if busy "$real"; then keep_wt "$w" "a process is using it"; continue; fi
+  # --no-optional-locks: looking must not refresh the index, or the worktree would stop being stale
+  if [ -n "$(git --no-optional-locks -C "$w" status --porcelain 2>/dev/null | head -n 1)" ]; then keep_wt "$w" "uncommitted or untracked files"; continue; fi
+  if ! git -C "$w" symbolic-ref -q HEAD >/dev/null && [ -z "$(git -C "$w" for-each-ref --contains HEAD refs/heads refs/remotes | head -n 1)" ]; then
+    keep_wt "$w" "its commits are on no branch"; continue
+  fi
+  kb=$(size_kb "$w")
+  if [ "$dry" = 1 ]; then
+    echo "would remove worktree $w"; cnoc progress "would remove worktree $w"
+  elif why=$(git worktree remove "$w" 2>&1); then
+    echo "removed worktree $w"; cnoc progress "removed worktree $w"
+  else
+    keep_wt "$w" "$(printf '%s' "$why" | head -n 1)"; continue
+  fi
+  wt_gone=$((wt_gone + 1)); freed_kb=$((freed_kb + ${kb:-0}))
+done 3<<LIST
+$worktrees
+LIST
+[ "$dry" = 1 ] || git worktree prune
+
+names=""
+for e in "$tmp"/*; do
+  [ -e "$e" ] || [ -L "$e" ] || continue
+  [ -O "$e" ] || continue                      # someone else's
+  if recent "$e" "$tmp_min"; then continue; fi    # not old
+  if busy "$e" || [ -n "$(find "$e" \( -type s -o -type p \) 2>/dev/null | head -n 1)" ]; then
+    tmp_kept=$((tmp_kept + 1)); echo "keep $e: in use"; continue
+  fi
+  kb=$(size_kb "$e")
+  if [ "$dry" = 1 ]; then echo "would remove $e"; else rm -rf -- "$e" && echo "removed $e" || continue; fi
+  tmp_gone=$((tmp_gone + 1)); freed_kb=$((freed_kb + ${kb:-0}))
+  [ "$tmp_gone" -gt 8 ] || names="$names ${e##*/}"
+done
+[ "$tmp_gone" -eq 0 ] || cnoc progress "$tmp:$names$([ "$tmp_gone" -le 8 ] || echo " and $((tmp_gone - 8)) more")"
+
+verb=removed; [ "$dry" = 1 ] && verb="DRY RUN, would remove"
+cnoc done "$verb $wt_gone worktrees ($wt_kept stale but kept) and $tmp_gone entries in $tmp ($tmp_kept old but in use); $((freed_kb / 1024)) MB"
+END

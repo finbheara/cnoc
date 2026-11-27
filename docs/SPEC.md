@@ -53,11 +53,12 @@ A Jobfile is YAML front matter followed by one instruction per line, in the Dock
 | Key | Required | Meaning |
 |---|---|---|
 | `id` | yes | Chosen by the submitter. Unique for the life of the server. Matches `[A-Za-z0-9._-]+(/[A-Za-z0-9._#-]+)*`. |
-| `priority` | no | Integer, higher first. Default 0. |
+| `priority` | no | Integer, higher is dispatched first. Default 0. It orders the queue and never interrupts a running job. |
 | `resources` | no | Map of name to count. Default `{ slots: 1 }`. |
-| `requires` | no | Host features needed beyond the implied ones. |
+| `requires` | no | Host features needed beyond the implied ones. `host/<name>` names one host. |
 | `depends` | no | Job ids that must be `done` first. |
 | `time` | no | Wall-clock limit for the whole job (`90s`, `30m`, `4h`, `1d2h`). |
+| `begin` | no | The job may not start before this. A time with a zone (`2027-01-31T03:00:00Z`), or `+duration` counted from submission. A time without a zone is an error. |
 | `labels` | no | Free-form map. Ignored by Cnoc. |
 
 An unknown key is an error.
@@ -75,13 +76,30 @@ An unknown key is an error.
 - `#` starts a comment line. A trailing `\` continues a line.
 - `RUN`, `WORKTREE` and `WORKDIR` are reserved and rejected.
 
-A job implies the features `project/<FROM>` and `harness/<name>` for each stage. A host is eligible only if it reports all of them.
+A job implies the features `project/<FROM>` and `harness/<name>` for each stage. A host is eligible only if it reports all of them. The server adds `host/<name>` to every host's features itself and drops any `host/` feature a client reports, so a host cannot answer for another.
 
 ### 3.3 Identity and immutability
 
 - The submitter picks the id, so a dependency can name a job before it is submitted.
 - Submitting an id that exists with the same text is a no-op. Submitting it with different text is refused.
 - A batch is atomic. Jobs in one batch may depend on each other; unknown dependencies and cycles reject the whole batch.
+
+### 3.4 Overrides
+
+A submitter may set three scheduling fields without editing the Jobfile: `on` (a host name, added as `host/<name>` to `requires`), `priority` and `begin`. They apply to every job in the call, are recorded in the `job.submitted` event, and are ignored for a job that already exists. An unknown host is refused.
+
+A job's priority can be changed while it is `blocked` or `queued`. Once a host has been given the job it cannot.
+
+### 3.5 Templates
+
+A template is a Jobfile stored on the server so it can be started repeatedly.
+
+- `ARG NAME` or `ARG NAME=default` declares an argument; names are capitals, digits and underscores. `ARG` is an error in a plain job.
+- Starting a template replaces `${NAME}` for every declared argument throughout the text, front matter included, and removes the `ARG` lines. Undeclared names are left alone. An argument with no default must be supplied; an unknown argument is an error.
+- The template's `id` is its name and may not contain an argument. Each run is submitted as the job `<name>/<n>`. The counter belongs to the name and survives removal of the template, so job ids are never reused.
+- A run is an ordinary job: its text is the filled-in template and does not change if the template does. It carries the label `template: <name>`.
+- Adding a template whose name exists replaces its text and keeps its number. A template is found by number, by name, or by the path of the file it was added from.
+- A template is validated when added, with `1` standing in for arguments that have no default.
 
 ## 4. Adapters
 
@@ -131,7 +149,7 @@ blocked ──► queued ──► assigned ──► running ──► done | f
 | State | Meaning |
 |---|---|
 | `blocked` | A dependency is not `done`. If one has failed or been cancelled, the reason names it. |
-| `queued` | Ready. `pending_reason` says why it is not placed: `resources`, `no-eligible-host`, `held-back`. |
+| `queued` | Ready. `pending_reason` says why it is not placed: `resources`, `no-eligible-host`, `held-back`, or `scheduled` when its `begin` time has not come. |
 | `assigned` | Handed to a host that has not yet started it. |
 | `running` | The host has started the first session. |
 | `done`, `failed`, `cancelled` | Terminal. `failed` carries a reason. |
@@ -153,6 +171,8 @@ Placement is three pluggable functions, after the Kubernetes scheduler:
 1. `order(queue)` — default: priority, then age.
 2. `filter(job, host)` — default: skip a host that recently declined the job.
 3. `score(job, host)` — default: most free capacity, least load.
+
+**Begin times.** A job whose `begin` is in the future is not offered to the policy at all. From its begin time on, it is aged from that time, not from submission.
 
 **Starvation.** A job that has waited longer than `starveAfterS` for resources holds back later jobs that want the same resource names on hosts that could run it. A job no host could ever fit holds nothing back.
 
@@ -220,12 +240,18 @@ Bearer token on every call except health. The admin token may do everything. A h
 
 | Call | Purpose |
 |---|---|
-| `POST /v1/jobs` | Submit. Body is one Jobfile as text, or `{ "jobs": [text...] }` as an atomic batch. |
+| `POST /v1/jobs` | Submit. Body is one Jobfile as text, or `{ "jobs": [text...], "overrides"?: { on, priority, begin } }` as an atomic batch. |
 | `GET /v1/jobs` | Non-terminal jobs. `?all=1`, `?state=a,b`, `?project=`. |
 | `GET /v1/job?id=` | One job with its text and attempts. |
 | `POST /v1/job/cancel?id=` | Cancel. Immediate before start; a request to the host after. |
 | `POST /v1/job/requeue?id=` | Run a failed or cancelled job again. |
 | `POST /v1/job/abandon?id=` | Admin. Give up on a running job whose host is offline. |
+| `POST /v1/job/priority?id=&value=` | Change the priority of a job that has not been dispatched. |
+| `GET /v1/templates` | Templates, without their text. |
+| `POST /v1/templates` | Admin. Add or replace: `{ "text", "source"? }`. |
+| `GET /v1/template?ref=` | One template with its text. `ref` is a number, a name or a source path. |
+| `DELETE /v1/template?ref=` | Admin. Remove. Jobs it started are unaffected. |
+| `POST /v1/template/run?ref=` | Start a job: `{ "set"?: { NAME: value }, "overrides"? }`. |
 | `GET /v1/hosts` | Hosts with capacity, reserved counts, load and running attempts. |
 | `POST /v1/host/approve?name=` | Admin. Approve a pending key. |
 | `POST /v1/host/drain?name=&on=1\|0` | Admin. Stop or resume placing work on a host. |
@@ -248,6 +274,9 @@ Each event is `{ seq, ts, type, job, attempt, host, actor, data }`. `seq` increa
 | `job.unstartable` | A dependency failed or was cancelled. |
 | `job.cancel_requested` | Cancel was asked of a job already on a host. |
 | `job.requeued` | A terminal job was sent round again. |
+| `job.priority` | A waiting job's priority was changed. |
+| `template.added`, `.updated`, `.removed` | A template changed. |
+| `template.run` | A template started a job; the event names the job and the arguments. |
 | `job.terminal` | The job is `done`, `failed` or `cancelled`. |
 | `attempt.assigned`, `.returned`, `.started`, `.progress`, `.ended` | The life of one attempt. |
 | `attempt.late_report` | A result arrived for an attempt that was no longer open. It is not applied. |

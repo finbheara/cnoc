@@ -17,6 +17,8 @@ Tested means covered by `bun test`: 41 unit tests and 22 end-to-end tests that r
 | Changelog | Numbered events, paging and long-poll, server-sent events, signed in-order webhooks, `/v1/state` snapshot. |
 | Updates | A client on the wrong version takes no work, runs its update command and exits for its service manager. |
 | Git intake | `cnoc ingest` of a checkout's `jobs/` directory. |
+| Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. |
+| When and where | `begin` (a time or a delay), `--on HOST` through a `host/NAME` feature, priority at submit and on a waiting job. |
 | Client install | `install.sh`: clone, `cnoc` command, config, and a systemd user unit or launchd agent that leaves tmux sessions alone on restart. |
 
 Checked by hand, not by the test suite:
@@ -73,6 +75,8 @@ In rough order of value.
 - **Logs from the server.** Scrollback is saved on the host; `cnoc log` should fetch it.
 - **Remote attach.**
 - **Automatic retry policy** per job. Requeue is manual.
+- **Recurring schedules.** A template can be started at a time, once. Nothing starts it every night; an external timer calling `cnoc template run` does that today.
+- **Templates from git.** `cnoc ingest` submits jobs only. Templates are added by hand.
 - **Server backup or a warm spare.** The whole state is one SQLite file; nothing copies it yet.
 
 ## Open questions

@@ -3,8 +3,8 @@
  * Every mutation appends at least one changelog event in the same transaction.
  */
 import { Database } from "bun:sqlite";
-import { JobfileError, parseJob } from "../jobfile";
-import type { AttemptEnd, ChangeEvent, JobSpec, JobState, Measured, Resources } from "../protocol";
+import { JobfileError, type TemplateArg, checkTemplate, instantiate, parseBegin, parseJob } from "../jobfile";
+import type { AttemptEnd, ChangeEvent, JobSpec, JobState, Measured, Overrides, Resources } from "../protocol";
 import { TERMINAL } from "../protocol";
 
 export interface JobRow {
@@ -42,6 +42,21 @@ export interface HostRow {
   measured: Measured | null;
   version: string | null;
   last_seen: number | null;
+}
+
+export interface TemplateRow {
+  id: number;
+  /** The id in the template's front matter. Instances are named `<name>/<n>`. */
+  name: string;
+  body: string;
+  args: TemplateArg[];
+  /** The file it was added from, as the submitter named it. */
+  source: string | null;
+  added_at: number;
+  updated_at: number;
+  runs: number;
+  last_run_at: number | null;
+  last_job: string | null;
 }
 
 export interface Subscription {
@@ -88,6 +103,9 @@ export class Store {
     this.db.run(`CREATE TABLE IF NOT EXISTS subscriptions(
       id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, types TEXT NOT NULL, secret TEXT NOT NULL, cursor INTEGER NOT NULL)`);
     this.db.run("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+    this.db.run(`CREATE TABLE IF NOT EXISTS templates(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, body TEXT NOT NULL, source TEXT,
+      added_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, runs INTEGER NOT NULL DEFAULT 0, last_run_at INTEGER, last_job TEXT)`);
   }
 
   close(): void {
@@ -181,10 +199,23 @@ export class Store {
    * Submits a batch atomically. A job already present with the same body is a no-op, so a
    * submitter can retry blindly; the same id with a different body is refused.
    */
-  submit(bodies: string[], actor: string): Array<{ id: string; state: JobState; created: boolean }> {
+  submit(
+    bodies: string[],
+    actor: string,
+    over: Overrides = {},
+    labels: Record<string, string> = {},
+  ): Array<{ id: string; state: JobState; created: boolean }> {
+    const now = Date.now();
+    if (over.on !== undefined && !this.host(over.on)) throw new SubmitError(`no such host: ${over.on}`, 404);
+    if (over.priority !== undefined && !Number.isInteger(over.priority)) throw new SubmitError("priority must be an integer");
     const specs = bodies.map((body, i) => {
       try {
-        return { body, spec: parseJob(body) };
+        const spec = parseJob(body, now);
+        if (over.on !== undefined && !spec.requires.includes(`host/${over.on}`)) spec.requires.push(`host/${over.on}`);
+        if (over.priority !== undefined) spec.priority = over.priority;
+        if (over.begin !== undefined) spec.begin_at = parseBegin(over.begin, now);
+        Object.assign(spec.labels, labels);
+        return { body, spec };
       } catch (e) {
         if (e instanceof JobfileError) throw new SubmitError(`job ${i + 1}: ${e.message}`);
         throw e;
@@ -218,7 +249,6 @@ export class Store {
 
     const out: Array<{ id: string; state: JobState; created: boolean }> = [];
     this.db.transaction(() => {
-      const now = Date.now();
       for (const { body, spec } of fresh) {
         this.db.run("INSERT INTO jobs(id, body, spec, state, submitted_at, updated_at) VALUES(?,?,?,?,?,?)", [
           spec.id,
@@ -233,7 +263,11 @@ export class Store {
       for (const { spec } of fresh) {
         const rest = this.restingState(spec);
         this.setJob(spec.id, rest.state, rest.reason);
-        this.emit("job.submitted", { job: spec.id, actor, data: { state: rest.state, project: spec.project, depends: spec.depends } });
+        this.emit("job.submitted", {
+          job: spec.id,
+          actor,
+          data: { state: rest.state, project: spec.project, depends: spec.depends, ...(Object.keys(over).length ? { overrides: over } : {}) },
+        });
       }
       for (const { spec } of specs) {
         const j = this.job(spec.id) as JobRow;
@@ -290,6 +324,110 @@ export class Store {
       this.setJob(id, rest.state, rest.reason, { cancel: 0 });
       this.emit("job.requeued", { job: id, actor, data: { state: rest.state } });
       return this.job(id) as JobRow;
+    })();
+  }
+
+  /** Changes where a job stands in the queue. Only a job no host has been given can move. */
+  setPriority(id: string, priority: number, actor: string): JobRow {
+    return this.db.transaction(() => {
+      const j = this.job(id);
+      if (!j) throw new SubmitError(`no such job: ${id}`, 404);
+      if (!Number.isInteger(priority)) throw new SubmitError("priority must be an integer");
+      if (j.state !== "queued" && j.state !== "blocked") throw new SubmitError(`job ${id} is ${j.state}; only a job that has not been dispatched can be reprioritised`, 409);
+      if (j.spec.priority !== priority) {
+        this.db.run("UPDATE jobs SET spec = ?, updated_at = ? WHERE id = ?", [json({ ...j.spec, priority }), Date.now(), id]);
+        this.emit("job.priority", { job: id, actor, data: { from: j.spec.priority, to: priority } });
+      }
+      return this.job(id) as JobRow;
+    })();
+  }
+
+  // ---- templates -----------------------------------------------------------
+
+  private templateRow(r: Raw | null): TemplateRow | null {
+    if (!r) return null;
+    const body = r.body as string;
+    let args: TemplateArg[] = [];
+    try {
+      args = checkTemplate(body).args;
+    } catch {
+      // A template stored by an older version may no longer parse; it still lists and can be removed.
+    }
+    return { ...(r as unknown as TemplateRow), body, args };
+  }
+
+  templates(): TemplateRow[] {
+    return (this.db.query("SELECT * FROM templates ORDER BY id").all() as Raw[]).map((r) => this.templateRow(r) as TemplateRow);
+  }
+
+  /** Finds a template by number, by name, or by the file it was added from. */
+  template(ref: string, path?: string): TemplateRow | null {
+    const q = (sql: string, v: string | number) => this.templateRow(this.db.query(sql).get(v) as Raw | null);
+    return (
+      (/^\d+$/.test(ref) ? q("SELECT * FROM templates WHERE id = ?", Number(ref)) : null) ??
+      q("SELECT * FROM templates WHERE name = ?", ref) ??
+      q("SELECT * FROM templates WHERE source = ?", ref) ??
+      (path ? q("SELECT * FROM templates WHERE source = ?", path) : null)
+    );
+  }
+
+  /** Saves a template. Adding the same name again replaces its content and keeps its number. */
+  templateAdd(body: string, source: string | null, actor: string): { template: TemplateRow; result: "added" | "updated" | "unchanged" } {
+    let name: string;
+    try {
+      name = checkTemplate(body).name;
+    } catch (e) {
+      if (e instanceof JobfileError) throw new SubmitError(e.message);
+      throw e;
+    }
+    return this.db.transaction(() => {
+      const have = this.template(name);
+      const now = Date.now();
+      let result: "added" | "updated" | "unchanged" = "unchanged";
+      if (!have) {
+        this.db.run("INSERT INTO templates(name, body, source, added_at, updated_at) VALUES(?,?,?,?,?)", [name, body, source, now, now]);
+        result = "added";
+      } else if (have.body !== body) {
+        this.db.run("UPDATE templates SET body = ?, source = ?, updated_at = ? WHERE id = ?", [body, source ?? have.source, now, have.id]);
+        result = "updated";
+      }
+      const template = this.template(name) as TemplateRow;
+      if (result !== "unchanged") this.emit(`template.${result}`, { actor, data: { template: template.id, name } });
+      return { template, result };
+    })();
+  }
+
+  templateRemove(ref: string, path: string | undefined, actor: string): TemplateRow {
+    const t = this.template(ref, path);
+    if (!t) throw new SubmitError(`no such template: ${ref}`, 404);
+    this.db.run("DELETE FROM templates WHERE id = ?", [t.id]);
+    this.emit("template.removed", { actor, data: { template: t.id, name: t.name } });
+    return t;
+  }
+
+  /** Submits a new job made from a template. Jobs it started earlier are not affected by later edits. */
+  templateRun(ref: string, set: Record<string, string>, over: Overrides, actor: string): { template: TemplateRow; job: string } {
+    return this.db.transaction(() => {
+      const t = this.template(ref);
+      if (!t) throw new SubmitError(`no such template: ${ref}`, 404);
+      // The counter is kept by name and outlives the template, so a removed and re-added
+      // template never reuses a job id.
+      const key = `template-runs:${t.name}`;
+      let n = Number(this.meta(key) ?? 0) + 1;
+      while (this.job(`${t.name}/${n}`)) n++;
+      this.meta(key, String(n));
+      const job = `${t.name}/${n}`;
+      let text: string;
+      try {
+        text = instantiate(t.body, set, job);
+      } catch (e) {
+        if (e instanceof JobfileError) throw new SubmitError(e.message);
+        throw e;
+      }
+      this.submit([text], actor, over, { template: t.name });
+      this.db.run("UPDATE templates SET runs = runs + 1, last_run_at = ?, last_job = ? WHERE id = ?", [Date.now(), job, t.id]);
+      this.emit("template.run", { job, actor, data: { template: t.id, name: t.name, set } });
+      return { template: this.template(String(t.id)) as TemplateRow, job };
     })();
   }
 

@@ -71,10 +71,11 @@ The front matter is what the server schedules on. The body is what the client ru
 |---|---|
 | `id` | Required, chosen by the submitter, never reused. Dependencies refer to it. |
 | `resources` | Named counters the job holds while it runs. Default `{ slots: 1 }`. |
-| `requires` | Extra host features, such as `linux` or `zfs`. |
+| `requires` | Extra host features, such as `linux` or `zfs`. `host/NAME` asks for one particular host. |
 | `depends` | Job ids that must be `done` first. |
-| `priority` | Higher runs first. Default 0. |
+| `priority` | Higher is dispatched first. Default 0. A running job is never interrupted. |
 | `time` | Wall-clock limit for the whole job, such as `90m` or `4h`. |
+| `begin` | Do not start before this: a time with a zone (`2027-01-31T03:00:00Z`) or a delay from submission (`+2h`). |
 | `labels` | Free-form; Cnoc ignores them. |
 
 | Instruction | Meaning |
@@ -85,6 +86,48 @@ The front matter is what the server schedules on. The body is what the client ru
 | `ENV NAME=value` | Environment for every session of the job. Not for secrets. |
 
 `RUN`, `WORKTREE` and `WORKDIR` are reserved and rejected for now. `cnoc check FILE...` validates Jobfiles with no server, for use in a repository check.
+
+## When and where
+
+The same things can be set when submitting, without editing the file:
+
+```
+cnoc submit nightly.job --at 03:00              # not before 03:00 local time
+cnoc submit report.job --after 2h --on workbox  # in two hours, on that host only
+cnoc submit hotfix.job --priority 10            # ahead of everything not yet dispatched
+cnoc priority myapp/1234 10                     # move a job that is already waiting
+```
+
+Priority only reorders the queue. Nothing running is stopped to make room, so a high-priority job still waits for a free slot.
+
+## Templates
+
+A template is a Jobfile the server keeps, so the same job can be started again and again. `ARG` lines declare what changes between runs; `${NAME}` is filled in wherever it appears, front matter included.
+
+```
+---
+id: disk-cleanup
+time: 30m
+---
+ARG PROJECT
+ARG TMP_HOURS=6
+FROM ${PROJECT}
+HARNESS shell
+PROMPT "find /tmp -maxdepth 1 -user $USER -mmin +$((${TMP_HOURS} * 60)) -print"
+```
+
+```
+cnoc template add disk-cleanup.job                               # prints its number and name
+cnoc template list
+cnoc template run disk-cleanup --set PROJECT=myapp --on workbox  # submits disk-cleanup/1
+cnoc template run 1 --set PROJECT=myapp --at 03:00               # by number; submits disk-cleanup/2
+cnoc template rm disk-cleanup.job                                # by number, name or file
+```
+
+- Each run is an ordinary job named `<template id>/<n>`. It keeps the content it was started with, whatever happens to the template later.
+- An `ARG` without a default must be given with `--set`. Only declared names are filled in, so `$USER` and `${HOME}` in a prompt reach the shell untouched.
+- Adding a template whose id already exists replaces its content and keeps its number.
+- `cnoc t` is short for `cnoc template`. [examples/disk-cleanup.job](examples/disk-cleanup.job) is a complete one.
 
 ## Reporting a result
 

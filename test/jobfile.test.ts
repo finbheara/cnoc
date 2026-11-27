@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { JobfileError, expand, parseAdapter, parseDuration, parseJob, shellQuote } from "../src/jobfile";
+import { JobfileError, checkTemplate, expand, instantiate, parseAdapter, parseBegin, parseDuration, parseJob, shellQuote } from "../src/jobfile";
 
 const job = (front: string, body: string) => `---\n${front}\n---\n${body}\n`;
 
@@ -92,4 +92,76 @@ test("parseDuration", () => {
 test("expand quotes only what it is told to and leaves shell variables alone", () => {
   const out = expand("run ${ARGS} ${PROMPT} ${HOME} $?", { ARGS: "-x", PROMPT: "it's here" }, (n, v) => (n === "PROMPT" ? shellQuote(v) : v));
   expect(out).toBe("run -x 'it'\\''s here' ${HOME} $?");
+});
+
+// ---- templates and begin ------------------------------------------------------
+
+const TEMPLATE = `---
+id: maint/cleanup
+resources: { slots: \${SLOTS} }
+---
+ARG PROJECT
+ARG SLOTS=1
+ARG HOURS="12"
+FROM \${PROJECT}
+HARNESS shell
+PROMPT <<END
+echo "older than \${HOURS}h in \${PWD} for \${USER}"
+END
+`;
+
+describe("templates", () => {
+  test("checkTemplate reports the name and arguments", () => {
+    expect(checkTemplate(TEMPLATE)).toEqual({
+      name: "maint/cleanup",
+      args: [
+        { name: "PROJECT", default: null },
+        { name: "SLOTS", default: "1" },
+        { name: "HOURS", default: "12" },
+      ],
+    });
+  });
+
+  test("instantiate fills declared arguments only, renames the job and keeps line numbers", () => {
+    const text = instantiate(TEMPLATE, { PROJECT: "app", HOURS: "6" }, "maint/cleanup/3");
+    expect(text.split("\n").length).toBe(TEMPLATE.split("\n").length);
+    const spec = parseJob(text);
+    expect(spec).toMatchObject({ id: "maint/cleanup/3", project: "app", resources: { slots: 1 } });
+    // PWD and USER are not arguments, so they are left for the shell.
+    expect(spec.stages[0]?.prompt).toBe('echo "older than 6h in ${PWD} for ${USER}"');
+  });
+
+  test("a missing or unknown argument is refused", () => {
+    expect(() => instantiate(TEMPLATE, {})).toThrow(/PROJECT has no default/);
+    expect(() => instantiate(TEMPLATE, { PROJECT: "app", NOPE: "1" })).toThrow(/unknown argument NOPE; this template takes: PROJECT, SLOTS, HOURS/);
+    expect(() => instantiate(TEMPLATE, { PROJECT: "a\nb" })).toThrow(/single line/);
+  });
+
+  test("a Jobfile with no ARG is a valid template, and ARG is refused in a plain job", () => {
+    const plain = "---\nid: a\n---\nFROM app\nHARNESS shell\nPROMPT true\n";
+    expect(checkTemplate(plain)).toEqual({ name: "a", args: [] });
+    expect(() => parseJob(TEMPLATE)).toThrow(/line 5: ARG makes this a template/);
+  });
+
+  test("bad templates are refused when added", () => {
+    expect(() => checkTemplate(TEMPLATE.replace("ARG SLOTS=1", "ARG slots=1"))).toThrow(/line 6: ARG takes NAME/);
+    expect(() => checkTemplate(TEMPLATE.replace("ARG SLOTS=1", "ARG PROJECT=x"))).toThrow(/declared twice/);
+    expect(() => checkTemplate(TEMPLATE.replace("id: maint/cleanup", "id: maint/${PROJECT}"))).toThrow(/cannot contain an argument/);
+    expect(() => checkTemplate(TEMPLATE.replace("HARNESS shell\n", ""))).toThrow(/PROMPT needs a HARNESS/);
+  });
+});
+
+describe("begin", () => {
+  const withBegin = (v: string) => `---\nid: a\nbegin: ${v}\n---\nFROM app\nHARNESS shell\nPROMPT true\n`;
+  test("an absolute time needs a zone", () => {
+    expect(parseJob(withBegin("2027-01-31T03:00:00Z")).begin_at).toBe(Date.UTC(2027, 0, 31, 3));
+    expect(parseJob(withBegin("2027-01-31T03:00:00-05:00")).begin_at).toBe(Date.UTC(2027, 0, 31, 8));
+    expect(() => parseJob(withBegin("2027-01-31T03:00:00"))).toThrow(/time with a zone/);
+    expect(() => parseJob(withBegin("tomorrow"))).toThrow(/time with a zone/);
+  });
+  test("a delay counts from submission", () => {
+    expect(parseJob(withBegin("+90m"), 1_000_000).begin_at).toBe(1_000_000 + 90 * 60_000);
+    expect(parseBegin("+2h", 0)).toBe(7_200_000);
+    expect(parseJob("---\nid: a\n---\nFROM app\nHARNESS shell\nPROMPT true\n").begin_at).toBeNull();
+  });
 });

@@ -7,7 +7,7 @@ import { createHash, createHmac, createPublicKey, randomBytes, verify } from "no
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Server as BunServer, ServerWebSocket } from "bun";
-import type { ChangeEvent, ClientMsg, JobState, Measured, Resources, ServerMsg } from "../protocol";
+import type { ChangeEvent, ClientMsg, JobState, Measured, Overrides, Resources, ServerMsg } from "../protocol";
 import { PROTOCOL, TERMINAL, VERSION, impliedFeatures } from "../protocol";
 import { type HostView, type Policy, type QueuedJob, defaultPolicy, schedule } from "./scheduler";
 import { type AttemptRow, Store, SubmitError } from "./store";
@@ -158,15 +158,22 @@ export class CnocServer {
 
   private runSchedule(): void {
     const now = Date.now();
-    const queue: QueuedJob[] = this.store.jobs(["queued"]).map((j) => ({
-      id: j.id,
-      priority: j.spec.priority,
-      submitted_at: j.submitted_at,
-      resources: j.spec.resources,
-      features: impliedFeatures(j.spec),
-    }));
+    const queued = this.store.jobs(["queued"]);
+    // A job with a begin time is not offered to the policy until that time. From then on it
+    // is aged from its begin time, so it neither jumps ahead nor counts as starved early.
+    const notYet = queued.filter((j) => (j.spec.begin_at ?? 0) > now);
+    const queue: QueuedJob[] = queued
+      .filter((j) => (j.spec.begin_at ?? 0) <= now)
+      .map((j) => ({
+        id: j.id,
+        priority: j.spec.priority,
+        submitted_at: Math.max(j.submitted_at, j.spec.begin_at ?? 0),
+        resources: j.spec.resources,
+        features: impliedFeatures(j.spec),
+      }));
+    const scheduled = Object.fromEntries(notYet.map((j) => [j.id, "scheduled" as const]));
     if (queue.length === 0) {
-      this.pending = {};
+      this.pending = scheduled;
       return;
     }
     const placement = schedule(
@@ -180,7 +187,7 @@ export class CnocServer {
       },
       this.policy,
     );
-    this.pending = placement.pending;
+    this.pending = { ...placement.pending, ...scheduled };
     for (const { job, host } of placement.assignments) {
       const ws = this.online.get(host);
       const row = this.store.job(job);
@@ -253,7 +260,9 @@ export class CnocServer {
 
   /** Reconciles the server's view of a host with what the host says it is running. */
   private onSync(ws: ServerWebSocket<Conn>, host: string, msg: Extract<ClientMsg, { t: "sync" }>): void {
-    this.store.inventory(host, msg.capacity, msg.features, this.version);
+    // host/<name> lets a job ask for one host. The server adds it, so a host cannot claim another's.
+    const features = [...msg.features.filter((f) => !f.startsWith("host/")), `host/${host}`];
+    this.store.inventory(host, msg.capacity, features, this.version);
     const running = new Set(msg.running);
     const ended = new Set(msg.ended);
     for (const a of this.store.openAttempts(host)) {
@@ -330,6 +339,8 @@ export class CnocServer {
       project: j.spec.project,
       priority: j.spec.priority,
       resources: j.spec.resources,
+      requires: j.spec.requires,
+      begin_at: j.spec.begin_at ?? null,
       depends: j.spec.depends,
       labels: j.spec.labels,
       submitted_at: j.submitted_at,
@@ -375,9 +386,10 @@ export class CnocServer {
       switch (route) {
         case "POST /v1/jobs": {
           const ct = req.headers.get("content-type") ?? "";
-          const bodies = ct.includes("json") ? ((await req.json()) as { jobs: string[] }).jobs : [await req.text()];
+          const sent = ct.includes("json") ? ((await req.json()) as { jobs: string[]; overrides?: Overrides }) : { jobs: [await req.text()] };
+          const bodies = sent.jobs;
           if (!Array.isArray(bodies) || bodies.some((b) => typeof b !== "string")) throw new SubmitError("expected { jobs: string[] }");
-          const jobs = this.store.submit(bodies, who.actor);
+          const jobs = this.store.submit(bodies, who.actor, sent.overrides ?? {});
           return J({ jobs, seq: this.store.seq() });
         }
         case "GET /v1/jobs": {
@@ -406,6 +418,31 @@ export class CnocServer {
         }
         case "POST /v1/job/requeue":
           return J({ job: this.jobView(this.store.requeue(id(), who.actor).id), seq: this.store.seq() });
+        case "POST /v1/job/priority":
+          return J({ job: this.jobView(this.store.setPriority(id(), Number(q.get("value") ?? Number.NaN), who.actor).id), seq: this.store.seq() });
+        case "GET /v1/templates":
+          return J({ templates: this.store.templates().map((t) => ({ ...t, body: undefined })) });
+        case "POST /v1/templates": {
+          admin();
+          const b = (await req.json()) as { text?: string; source?: string };
+          if (typeof b.text !== "string") throw new SubmitError("expected { text, source? }");
+          return J({ ...this.store.templateAdd(b.text, b.source ?? null, who.actor), seq: this.store.seq() });
+        }
+        case "GET /v1/template": {
+          const t = this.store.template(q.get("ref") ?? "", q.get("path") ?? undefined);
+          if (!t) return J({ error: "no such template" }, 404);
+          return J({ template: t });
+        }
+        case "DELETE /v1/template":
+          admin();
+          return J({ template: { ...this.store.templateRemove(q.get("ref") ?? "", q.get("path") ?? undefined, who.actor), body: undefined }, seq: this.store.seq() });
+        case "POST /v1/template/run": {
+          const b = (await req.json().catch(() => ({}))) as { set?: Record<string, string>; overrides?: Overrides };
+          const set = b.set ?? {};
+          if (typeof set !== "object" || Object.values(set).some((v) => typeof v !== "string")) throw new SubmitError("expected { set: { NAME: value } }");
+          const r = this.store.templateRun(q.get("ref") ?? "", set, b.overrides ?? {}, who.actor);
+          return J({ job: this.jobView(r.job), template: { ...r.template, body: undefined }, seq: this.store.seq() });
+        }
         case "POST /v1/job/abandon": {
           // Gives up on a running attempt whose host is unreachable. The session may still
           // be alive there; if the host returns it is told to stop.
