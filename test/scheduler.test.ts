@@ -20,11 +20,21 @@ const job = (id: string, over: Partial<QueuedJob> = {}): QueuedJob => ({
   features: ["project/app", "harness/shell"],
   ...over,
 });
-const ctx = (over: Partial<SchedContext> = {}): SchedContext => ({ now: NOW, pools: {}, backedOff: () => false, starve_after_s: 600, ...over });
+const ctx = (over: Partial<SchedContext> = {}): SchedContext => ({
+  now: NOW,
+  pools: {},
+  backedOff: () => false,
+  starve_after_s: 600,
+  ...over,
+});
 
 test("priority first, then age", () => {
   const p = schedule(
-    [job("old", { submitted_at: NOW - 5000 }), job("new", { submitted_at: NOW - 1000 }), job("urgent", { priority: 9 })],
+    [
+      job("old", { submitted_at: NOW - 5000 }),
+      job("new", { submitted_at: NOW - 1000 }),
+      job("urgent", { priority: 9 }),
+    ],
     [host("a", { capacity: { slots: 1 } })],
     ctx(),
   );
@@ -33,12 +43,18 @@ test("priority first, then age", () => {
 });
 
 test("a job lands only on a host with its features", () => {
-  const p = schedule([job("j", { features: ["project/data"] })], [host("a"), host("b", { features: ["project/data"] })], ctx());
+  const p = schedule(
+    [job("j", { features: ["project/data"] })],
+    [host("a"), host("b", { features: ["project/data"] })],
+    ctx(),
+  );
   expect(p.assignments).toEqual([{ job: "j", host: "b" }]);
 });
 
 test("no host has the feature", () => {
-  expect(schedule([job("j", { features: ["project/nope"] })], [host("a")], ctx()).pending).toEqual({ j: "no-eligible-host" });
+  expect(schedule([job("j", { features: ["project/nope"] })], [host("a")], ctx()).pending).toEqual({
+    j: "no-eligible-host",
+  });
 });
 
 test("offline and drained hosts get nothing", () => {
@@ -55,7 +71,9 @@ test("capacity is respected within one pass and spreads across hosts", () => {
 });
 
 test("a resource the host does not declare cannot be requested from it", () => {
-  expect(schedule([job("j", { resources: { gpu: 1 } })], [host("a")], ctx()).pending).toEqual({ j: "no-eligible-host" });
+  expect(schedule([job("j", { resources: { gpu: 1 } })], [host("a")], ctx()).pending).toEqual({
+    j: "no-eligible-host",
+  });
 });
 
 test("a fleet pool caps jobs across hosts", () => {
@@ -87,11 +105,16 @@ test("a job no host could ever fit does not hold others back", () => {
 });
 
 test("a custom policy can reorder and rescore", () => {
-  const p = schedule([job("x"), job("y")], [host("a", { capacity: { slots: 1 } }), host("b", { capacity: { slots: 1 } })], ctx(), {
-    ...defaultPolicy,
-    order: (jobs) => [...jobs].reverse(),
-    score: (_j, h) => (h.name === "b" ? 1 : 0),
-  });
+  const p = schedule(
+    [job("x"), job("y")],
+    [host("a", { capacity: { slots: 1 } }), host("b", { capacity: { slots: 1 } })],
+    ctx(),
+    {
+      ...defaultPolicy,
+      order: (jobs) => [...jobs].reverse(),
+      score: (_j, h) => (h.name === "b" ? 1 : 0),
+    },
+  );
   expect(p.assignments).toEqual([
     { job: "y", host: "b" },
     { job: "x", host: "a" },

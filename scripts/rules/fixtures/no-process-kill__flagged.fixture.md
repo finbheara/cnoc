@@ -1,0 +1,15 @@
+#fixture @rule no-process-kill
+#fixture @expect 5
+#fixture @path .claude/skills/example/SKILL.md
+# Restarting the daemon
+
+Stop the old one with `pkill -f serverd`, then start it again.
+
+If it does not stop, run `kill -9 $PID`.
+
+```
+killall bun
+kill -s KILL 4242
+```
+
+- Clean up stray workers: pkill bun

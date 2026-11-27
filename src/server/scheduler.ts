@@ -67,7 +67,12 @@ export const defaultPolicy: Policy = {
   },
 };
 
-export function schedule(jobs: QueuedJob[], hosts: HostView[], ctx: SchedContext, policy: Policy = defaultPolicy): Placement {
+export function schedule(
+  jobs: QueuedJob[],
+  hosts: HostView[],
+  ctx: SchedContext,
+  policy: Policy = defaultPolicy,
+): Placement {
   const reserved = new Map(hosts.map((h) => [h.name, { ...h.reserved }]));
   const poolUsed: Record<string, number> = Object.fromEntries(Object.entries(ctx.pools).map(([k, v]) => [k, v.used]));
   /** Resource names a starving job is waiting for, per host and for pools. */

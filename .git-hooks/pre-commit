@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Pre-commit hook: the static gate. A commit runs no tests.
+#
+# The ladder is pre-commit (static only) -> pre-push (static + the test suite). Both run one
+# command, `bun am-i-done`, in a different mode, so a hook and a person share one definition of done.
+#
+# Installed by `bun install` (package.json "prepare" points core.hooksPath here).
+
+set -euo pipefail
+
+if [ -z "$(git diff --cached --name-only --diff-filter=d)" ]; then
+  echo "No staged files, skipping checks."
+  exit 0
+fi
+
+# git exports its repository-location variables to a hook, and every child inherits them. They
+# override `git -C <dir>` and `git init <dir>`, so a check that ran git in a scratch directory
+# would act on this repository. The gate runs from the checkout root and needs none of them.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_PREFIX GIT_NAMESPACE GIT_QUARANTINE_PATH
+
+exec bun run am-i-done --pre-commit

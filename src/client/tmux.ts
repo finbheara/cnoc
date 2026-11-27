@@ -16,7 +16,11 @@ export class Tmux {
       stdin: "ignore",
       env: env ? { ...process.env, ...env } : process.env,
     });
-    const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+    const [out, err, code] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+      p.exited,
+    ]);
     return { code, out, err };
   }
 
@@ -25,13 +29,39 @@ export class Tmux {
     // remain-on-exit keeps a finished pane around long enough to read its exit status and scrollback.
     // tmux gives a new session's first process the PATH of the tmux command that created it,
     // ignoring -e, so the job's PATH has to be set on that command too.
-    const r = await this.run([
-      // /bin/sh keeps a person's shell profile from rewriting the environment the job was given.
-      "set-option", "-g", "default-shell", "/bin/sh", ";",
-      "set-option", "-g", "remain-on-exit", "on", ";",
-      "set-option", "-g", "history-limit", "50000", ";",
-      "new-session", "-d", "-s", name, "-x", "220", "-y", "50", "-c", cwd, ...envArgs, cmd,
-    ], env.PATH ? { PATH: env.PATH } : undefined);
+    const r = await this.run(
+      [
+        // /bin/sh keeps a person's shell profile from rewriting the environment the job was given.
+        "set-option",
+        "-g",
+        "default-shell",
+        "/bin/sh",
+        ";",
+        "set-option",
+        "-g",
+        "remain-on-exit",
+        "on",
+        ";",
+        "set-option",
+        "-g",
+        "history-limit",
+        "50000",
+        ";",
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-x",
+        "220",
+        "-y",
+        "50",
+        "-c",
+        cwd,
+        ...envArgs,
+        cmd,
+      ],
+      env.PATH ? { PATH: env.PATH } : undefined,
+    );
     if (r.code !== 0) throw new Error(`tmux new-session failed: ${r.err.trim() || r.out.trim()}`);
   }
 

@@ -3,9 +3,10 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CnocClient, loadClientConfig } from "./client/client";
-import { JobfileError, checkTemplate, parseJob } from "./jobfile";
+import { JobfileError, checkTemplate, declaresArgs, parseJob } from "./jobfile";
 import { type ChangeEvent, type Overrides, PROTOCOL, VERSION } from "./protocol";
-import { CnocServer, type ServerOptions } from "./server/server";
+import { CnocServer, type HostInfo, type JobInfo, type ServerOptions } from "./server/server";
+import type { AttemptRow, TemplateRow } from "./server/store";
 
 const HELP = `cnoc ${VERSION} - batch scheduling of agent harness sessions across persistent hosts
 
@@ -79,7 +80,13 @@ const str = (v: string | true | undefined, fallback: string): string => (typeof 
 class CliError extends Error {}
 
 /** Calls the server: through the client's local socket inside a job, directly otherwise. */
-async function api(method: string, path: string, body?: unknown, contentType = "application/json"): Promise<any> {
+/** What the server answers to a submission. */
+type Submitted = { jobs: Array<{ id: string; state: string; created: boolean }> };
+type OneJob = { job: JobInfo };
+/** A template as listed: everything but its text. */
+type TemplateInfo = Omit<TemplateRow, "body">;
+
+async function api<T>(method: string, path: string, body?: unknown, contentType = "application/json"): Promise<T> {
   const sock = process.env.CNOC_SOCK;
   let base: string;
   let token: string | undefined;
@@ -101,19 +108,32 @@ async function api(method: string, path: string, body?: unknown, contentType = "
   } as RequestInit).catch((e: Error) => {
     throw new CliError(`cannot reach ${unix ?? base}: ${e.message}`);
   });
-  const out = (await res.json().catch(() => ({}))) as { error?: string };
+  const out = (await res.json().catch(() => ({}))) as T & { error?: string };
   if (!res.ok) throw new CliError(out.error ?? `${res.status} ${res.statusText}`);
   return out;
 }
 
 function table(rows: string[][]): string {
   const widths = rows[0]?.map((_, c) => Math.max(...rows.map((r) => (r[c] ?? "").length))) ?? [];
-  return rows.map((r) => r.map((cell, c) => cell.padEnd(widths[c] ?? 0)).join("  ").trimEnd()).join("\n");
+  return rows
+    .map((r) =>
+      r
+        .map((cell, c) => cell.padEnd(widths[c] ?? 0))
+        .join("  ")
+        .trimEnd(),
+    )
+    .join("\n");
 }
 
 const age = (ms: number): string => {
   const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d`;
+  return s < 60
+    ? `${s}s`
+    : s < 3600
+      ? `${Math.floor(s / 60)}m`
+      : s < 86400
+        ? `${Math.floor(s / 3600)}h`
+        : `${Math.floor(s / 86400)}d`;
 };
 
 function jobFiles(dir: string): string[] {
@@ -161,17 +181,22 @@ const clock = (ms: number): string => {
 
 /** Why a job is waiting, for the queue listing. */
 const why = (j: { reason?: string | null; pending_reason?: string | null; begin_at?: number | null }): string =>
-  j.reason ?? (j.pending_reason === "scheduled" && j.begin_at ? `not before ${clock(j.begin_at)}` : (j.pending_reason ?? ""));
+  j.reason ??
+  (j.pending_reason === "scheduled" && j.begin_at ? `not before ${clock(j.begin_at)}` : (j.pending_reason ?? ""));
 
 function printEvent(e: ChangeEvent): void {
-  const who = [e.job, e.attempt !== null ? `#${e.attempt}` : null, e.host ? `@${e.host}` : null].filter(Boolean).join(" ");
+  const who = [e.job, e.attempt !== null ? `#${e.attempt}` : null, e.host ? `@${e.host}` : null]
+    .filter(Boolean)
+    .join(" ");
   const data = e.data && Object.keys(e.data as object).length ? ` ${JSON.stringify(e.data)}` : "";
-  console.log(`${String(e.seq).padStart(6)}  ${new Date(e.ts).toISOString().slice(11, 19)}  ${e.type.padEnd(22)} ${who}${data}`);
+  console.log(
+    `${String(e.seq).padStart(6)}  ${new Date(e.ts).toISOString().slice(11, 19)}  ${e.type.padEnd(22)} ${who}${data}`,
+  );
 }
 
 async function report(status: "done" | "failed", summary: string): Promise<void> {
   if (!process.env.CNOC_SOCK) throw new CliError("not inside a Cnoc job (CNOC_SOCK is not set)");
-  const r = await api("POST", "/attempt/result", { status, summary });
+  const r = await api<{ accepted: boolean }>("POST", "/attempt/result", { status, summary });
   console.log(r.accepted ? `reported ${status}` : "a result was already reported for this stage");
 }
 
@@ -195,7 +220,10 @@ async function main(): Promise<void> {
       return console.log(`${VERSION} (protocol ${PROTOCOL})`);
 
     case "server": {
-      const file = typeof flags.config === "string" ? (JSON.parse(readFileSync(home(flags.config), "utf8")) as Partial<ServerOptions>) : {};
+      const file =
+        typeof flags.config === "string"
+          ? (JSON.parse(readFileSync(home(flags.config), "utf8")) as Partial<ServerOptions>)
+          : {};
       const server = await new CnocServer({
         ...file,
         dataDir: home(str(flags.data, file.dataDir ?? "~/.local/share/cnoc")),
@@ -204,7 +232,9 @@ async function main(): Promise<void> {
         openEnrollment: flags["open-enrollment"] === true || file.openEnrollment === true,
       }).start();
       console.log(`[server] cnoc ${server.version} listening on ${server.url}`);
-      console.log(`[server] admin token: ${join(home(str(flags.data, file.dataDir ?? "~/.local/share/cnoc")), "admin.token")}`);
+      console.log(
+        `[server] admin token: ${join(home(str(flags.data, file.dataDir ?? "~/.local/share/cnoc")), "admin.token")}`,
+      );
       process.on("SIGINT", () => void server.stop().then(() => process.exit(0)));
       process.on("SIGTERM", () => void server.stop().then(() => process.exit(0)));
       return;
@@ -223,7 +253,7 @@ async function main(): Promise<void> {
       for (const f of pos) {
         try {
           const text = readFileSync(f, "utf8");
-          if (/^\s*ARG\s/im.test(text)) {
+          if (declaresArgs(text)) {
             const t = checkTemplate(text);
             const args = t.args.map((a) => (a.default === null ? a.name : `${a.name}=${a.default}`)).join(", ");
             console.log(`ok    ${f}  (template ${t.name}; arguments: ${args})`);
@@ -244,7 +274,10 @@ async function main(): Promise<void> {
 
     case "submit": {
       need(0, "FILE");
-      const r = await api("POST", "/v1/jobs", { jobs: pos.map((f) => readFileSync(f, "utf8")), overrides: overrides(flags) });
+      const r = await api<Submitted>("POST", "/v1/jobs", {
+        jobs: pos.map((f) => readFileSync(f, "utf8")),
+        overrides: overrides(flags),
+      });
       for (const j of r.jobs) console.log(`${j.created ? "submitted" : "unchanged"}  ${j.id}  ${j.state}`);
       return;
     }
@@ -263,24 +296,37 @@ async function main(): Promise<void> {
         case "add": {
           need(1, "FILE");
           for (const f of pos.slice(1)) {
-            const r = await api("POST", "/v1/templates", { text: readFileSync(f, "utf8"), source: resolve(f) });
+            const r = await api<{ template: TemplateInfo; result: string }>("POST", "/v1/templates", {
+              text: readFileSync(f, "utf8"),
+              source: resolve(f),
+            });
             console.log(`${r.template.id}  ${r.template.name}  ${r.result}`);
           }
           return;
         }
         case "list":
         case "ls": {
-          const r = await api("GET", "/v1/templates");
+          const r = await api<{ templates: TemplateInfo[] }>("GET", "/v1/templates");
           if (asJson) return console.log(JSON.stringify(r, null, 2));
           if (r.templates.length === 0) return console.log("no templates; add one with: cnoc template add FILE");
           const rows = [["ID", "NAME", "ARGUMENTS", "RUNS", "LAST RUN", "FROM"]];
-          for (const t of r.templates) rows.push([String(t.id), t.name, args(t), String(t.runs), t.last_run_at ? `${age(t.last_run_at)} ago` : "-", t.source ?? "-"]);
+          for (const t of r.templates)
+            rows.push([
+              String(t.id),
+              t.name,
+              args(t),
+              String(t.runs),
+              t.last_run_at ? `${age(t.last_run_at)} ago` : "-",
+              t.source ?? "-",
+            ]);
           return console.log(table(rows));
         }
         case "show": {
-          const r = await api("GET", `/v1/template?${ref()}`);
+          const r = await api<{ template: TemplateRow }>("GET", `/v1/template?${ref()}`);
           if (asJson) return console.log(JSON.stringify(r, null, 2));
-          console.log(`# template ${r.template.id}: ${r.template.name}   arguments: ${args(r.template)}   runs: ${r.template.runs}`);
+          console.log(
+            `# template ${r.template.id}: ${r.template.name}   arguments: ${args(r.template)}   runs: ${r.template.runs}`,
+          );
           return console.log(r.template.body.trimEnd());
         }
         case "run": {
@@ -290,12 +336,12 @@ async function main(): Promise<void> {
             if (i < 1) throw new CliError(`--set takes NAME=VALUE, got ${kv}`);
             set[kv.slice(0, i)] = kv.slice(i + 1);
           }
-          const r = await api("POST", `/v1/template/run?${ref()}`, { set, overrides: overrides(flags) });
+          const r = await api<OneJob>("POST", `/v1/template/run?${ref()}`, { set, overrides: overrides(flags) });
           return console.log(`submitted  ${r.job.id}  ${r.job.state}${why(r.job) ? `  (${why(r.job)})` : ""}`);
         }
         case "rm":
         case "remove": {
-          const r = await api("DELETE", `/v1/template?${ref()}`);
+          const r = await api<{ template: TemplateInfo }>("DELETE", `/v1/template?${ref()}`);
           return console.log(`removed  ${r.template.id}  ${r.template.name}`);
         }
         default:
@@ -304,7 +350,10 @@ async function main(): Promise<void> {
     }
 
     case "priority": {
-      const r = await api("POST", `/v1/job/priority?id=${encodeURIComponent(need(0, "ID"))}&value=${encodeURIComponent(need(1, "N"))}`);
+      const r = await api<OneJob>(
+        "POST",
+        `/v1/job/priority?id=${encodeURIComponent(need(0, "ID"))}&value=${encodeURIComponent(need(1, "N"))}`,
+      );
       return console.log(`${r.job.id}  priority ${r.job.priority}  ${r.job.state}`);
     }
 
@@ -319,14 +368,14 @@ async function main(): Promise<void> {
         const files = jobFiles(join(dir, "jobs"));
         const bodies = files.map((f) => readFileSync(f, "utf8"));
         try {
-          const r = await api("POST", "/v1/jobs", { jobs: bodies });
+          const r = await api<Submitted>("POST", "/v1/jobs", { jobs: bodies });
           for (const j of r.jobs) if (j.created) console.log(`[ingest] submitted ${j.id} (${j.state})`);
         } catch (batchError) {
           // One bad file must not hold back the rest: fall back to one at a time.
           console.error(`[ingest] batch refused: ${(batchError as Error).message}`);
           for (const [i, body] of bodies.entries()) {
             try {
-              const r = await api("POST", "/v1/jobs", { jobs: [body] });
+              const r = await api<Submitted>("POST", "/v1/jobs", { jobs: [body] });
               if (r.jobs[0]?.created) console.log(`[ingest] submitted ${r.jobs[0].id} (${r.jobs[0].state})`);
             } catch (e) {
               console.error(`[ingest] ${files[i]}: ${(e as Error).message}`);
@@ -339,43 +388,59 @@ async function main(): Promise<void> {
     }
 
     case "queue": {
-      const r = await api("GET", `/v1/jobs${flags.all ? "?all=1" : ""}`);
+      const r = await api<{ jobs: JobInfo[] }>("GET", `/v1/jobs${flags.all ? "?all=1" : ""}`);
       if (asJson) return console.log(JSON.stringify(r, null, 2));
       if (r.jobs.length === 0) return console.log("nothing queued or running");
       const rows = [["JOB", "STATE", "HOST", "PRIO", "AGE", "WHY"]];
-      for (const j of r.jobs) rows.push([j.id, j.state, j.host ?? "-", String(j.priority), age(j.submitted_at), why(j)]);
+      for (const j of r.jobs)
+        rows.push([j.id, j.state, j.host ?? "-", String(j.priority), age(j.submitted_at), why(j)]);
       return console.log(table(rows));
     }
 
     case "show": {
-      const r = await api("GET", `/v1/job?id=${encodeURIComponent(need(0, "ID"))}`);
+      const r = await api<{ job: JobInfo; attempts: AttemptRow[] }>(
+        "GET",
+        `/v1/job?id=${encodeURIComponent(need(0, "ID"))}`,
+      );
       if (asJson) return console.log(JSON.stringify(r, null, 2));
       const j = r.job;
-      console.log(`${j.id}  ${j.state}${j.reason ? `  (${j.reason})` : ""}${j.pending_reason ? `  waiting: ${j.pending_reason}` : ""}`);
-      console.log(`project ${j.project}  priority ${j.priority}  resources ${JSON.stringify(j.resources)}  depends ${JSON.stringify(j.depends)}`);
+      console.log(
+        `${j.id}  ${j.state}${j.reason ? `  (${j.reason})` : ""}${j.pending_reason ? `  waiting: ${j.pending_reason}` : ""}`,
+      );
+      console.log(
+        `project ${j.project}  priority ${j.priority}  resources ${JSON.stringify(j.resources)}  depends ${JSON.stringify(j.depends)}`,
+      );
       if (j.requires?.length) console.log(`requires ${j.requires.join(", ")}`);
       if (j.begin_at) console.log(`not before ${new Date(j.begin_at).toLocaleString()}`);
-      for (const a of r.attempts) console.log(`  attempt ${a.id} on ${a.host}: ${a.state}${a.outcome ? ` ${a.outcome}` : ""}${a.reason ? ` (${a.reason})` : ""}`);
-      for (const [i, s] of ((j.result as Array<{ status: string; summary: string }> | null) ?? []).entries()) console.log(`  stage ${i + 1}: ${s.status}  ${s.summary}`);
+      for (const a of r.attempts)
+        console.log(
+          `  attempt ${a.id} on ${a.host}: ${a.state}${a.outcome ? ` ${a.outcome}` : ""}${a.reason ? ` (${a.reason})` : ""}`,
+        );
+      for (const [i, s] of (j.result ?? []).entries()) console.log(`  stage ${i + 1}: ${s.status}  ${s.summary}`);
       return;
     }
 
     case "cancel":
     case "requeue":
     case "abandon": {
-      const r = await api("POST", `/v1/job/${cmd}?id=${encodeURIComponent(need(0, "ID"))}`);
+      const r = await api<OneJob>("POST", `/v1/job/${cmd}?id=${encodeURIComponent(need(0, "ID"))}`);
       return console.log(`${r.job.id}  ${r.job.state}${r.job.cancel_requested ? "  (cancel requested)" : ""}`);
     }
 
     case "hosts": {
-      if (pos[0] === "approve") return console.log(`approved ${(await api("POST", `/v1/host/approve?name=${encodeURIComponent(need(1, "NAME"))}`)).host.name}`);
-      const r = await api("GET", "/v1/hosts");
+      if (pos[0] === "approve")
+        return console.log(
+          `approved ${(await api<{ host: { name: string } }>("POST", `/v1/host/approve?name=${encodeURIComponent(need(1, "NAME"))}`)).host.name}`,
+        );
+      const r = await api<{ hosts: HostInfo[] }>("GET", "/v1/hosts");
       if (asJson) return console.log(JSON.stringify(r, null, 2));
       if (r.hosts.length === 0) return console.log("no hosts have connected");
       const rows = [["HOST", "STATUS", "RUNNING", "RESERVED / CAPACITY", "LOAD", "KEY"]];
       for (const h of r.hosts) {
         const status = h.status === "pending" ? "pending" : h.drained ? "drained" : h.online ? "online" : "offline";
-        const res = Object.keys(h.capacity).map((n: string) => `${n} ${h.reserved[n] ?? 0}/${h.capacity[n]}`).join(", ");
+        const res = Object.keys(h.capacity)
+          .map((n: string) => `${n} ${h.reserved[n] ?? 0}/${h.capacity[n]}`)
+          .join(", ");
         const load = h.measured ? (h.measured.load1 / Math.max(1, h.measured.cpus)).toFixed(2) : "-";
         rows.push([h.name, status, String(h.running.length), res || "-", load, h.fingerprint]);
       }
@@ -383,13 +448,18 @@ async function main(): Promise<void> {
     }
     case "drain":
     case "undrain": {
-      const r = await api("POST", `/v1/host/drain?name=${encodeURIComponent(need(0, "NAME"))}&on=${cmd === "drain" ? 1 : 0}`);
+      const r = await api<{ host: { name: string; drained: boolean } }>(
+        "POST",
+        `/v1/host/drain?name=${encodeURIComponent(need(0, "NAME"))}&on=${cmd === "drain" ? 1 : 0}`,
+      );
       return console.log(`${r.host.name}  ${r.host.drained ? "drained" : "accepting work"}`);
     }
 
     case "attach": {
       const session = `cnoc-${need(0, "ATTEMPT")}-${Number(pos[1] ?? 1) - 1}`;
-      const p = Bun.spawn(["tmux", "-L", process.env.CNOC_TMUX_SOCKET ?? "cnoc", "attach", "-r", "-t", `=${session}`], { stdio: ["inherit", "inherit", "inherit"] });
+      const p = Bun.spawn(["tmux", "-L", process.env.CNOC_TMUX_SOCKET ?? "cnoc", "attach", "-r", "-t", `=${session}`], {
+        stdio: ["inherit", "inherit", "inherit"],
+      });
       process.exit(await p.exited);
       return;
     }
@@ -397,7 +467,10 @@ async function main(): Promise<void> {
     case "events": {
       let after = Number(str(flags.after, "0"));
       for (;;) {
-        const r = await api("GET", `/v1/events?after=${after}&wait=${flags.follow ? 30 : 0}`);
+        const r = await api<{ events: ChangeEvent[]; next: number }>(
+          "GET",
+          `/v1/events?after=${after}&wait=${flags.follow ? 30 : 0}`,
+        );
         for (const e of r.events as ChangeEvent[]) asJson ? console.log(JSON.stringify(e)) : printEvent(e);
         after = r.next;
         if (!flags.follow && r.events.length === 0) return;
@@ -406,7 +479,7 @@ async function main(): Promise<void> {
 
     case "progress": {
       if (!process.env.CNOC_SOCK) throw new CliError("not inside a Cnoc job (CNOC_SOCK is not set)");
-      await api("POST", "/attempt/progress", { note: pos.join(" ") });
+      await api<unknown>("POST", "/attempt/progress", { note: pos.join(" ") });
       return;
     }
     case "done":

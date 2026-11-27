@@ -132,7 +132,14 @@ export class AttemptRunner {
       if (this.cancelReason) throw new Error("cancelled");
       if (step.op === "tmux") {
         const cmd = expand(step.cmd, this.vars(), (name, v) => (QUOTED.has(name) ? shellQuote(v) : v));
-        const env = { ...st.spec.env, ...deps.baseEnv, CNOC_TOKEN: st.token, CNOC_JOB: st.spec.id, CNOC_ATTEMPT: String(st.attempt), CNOC_STAGE: String(st.stage + 1) };
+        const env = {
+          ...st.spec.env,
+          ...deps.baseEnv,
+          CNOC_TOKEN: st.token,
+          CNOC_JOB: st.spec.id,
+          CNOC_ATTEMPT: String(st.attempt),
+          CNOC_STAGE: String(st.stage + 1),
+        };
         await deps.tmux.newSession(session, cwd, env, cmd);
         if (st.stage === 0) deps.onStarted(st.attempt);
       } else {
@@ -158,9 +165,17 @@ export class AttemptRunner {
         if (re.test(screen)) return;
         if (this.cancelReason) throw new Error("cancelled");
         // What the screen showed instead is usually the whole diagnosis (a login or trust prompt, say).
-        const saw = screen.split("\n").map((l) => l.trim()).filter(Boolean).slice(-3).join(" | ").slice(0, 300);
-        if ((await tmux.status(session)).state !== "running") throw new Error(`session ended while waiting for /${step.pattern}/; screen: ${saw}`);
-        if (Date.now() > until) throw new Error(`timed out after ${step.timeout_s}s waiting for /${step.pattern}/; screen: ${saw}`);
+        const saw = screen
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .slice(-3)
+          .join(" | ")
+          .slice(0, 300);
+        if ((await tmux.status(session)).state !== "running")
+          throw new Error(`session ended while waiting for /${step.pattern}/; screen: ${saw}`);
+        if (Date.now() > until)
+          throw new Error(`timed out after ${step.timeout_s}s waiting for /${step.pattern}/; screen: ${saw}`);
         await sleep(Math.min(500, this.deps.pollMs));
       }
     }
@@ -171,7 +186,8 @@ export class AttemptRunner {
     for (;;) {
       if (st.reported) return { kind: "result" };
       if (this.cancelReason) return { kind: "end", outcome: "cancelled", reason: this.cancelReason };
-      if (st.deadline !== null && Date.now() > st.deadline) return { kind: "end", outcome: "failed", reason: "timeout" };
+      if (st.deadline !== null && Date.now() > st.deadline)
+        return { kind: "end", outcome: "failed", reason: "timeout" };
       const status = await this.deps.tmux.status(session);
       if (status.state !== "running") {
         // The report and the exit can land in either order; give the report a moment.

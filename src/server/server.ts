@@ -7,10 +7,19 @@ import { createHash, createHmac, createPublicKey, randomBytes, verify } from "no
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Server as BunServer, ServerWebSocket } from "bun";
-import type { ChangeEvent, ClientMsg, JobState, Measured, Overrides, Resources, ServerMsg } from "../protocol";
+import type {
+  ChangeEvent,
+  ClientMsg,
+  JobState,
+  Measured,
+  Overrides,
+  Resources,
+  ServerMsg,
+  StageResult,
+} from "../protocol";
 import { PROTOCOL, TERMINAL, VERSION, impliedFeatures } from "../protocol";
 import { type HostView, type Policy, type QueuedJob, defaultPolicy, schedule } from "./scheduler";
-import { type AttemptRow, Store, SubmitError } from "./store";
+import { type AttemptRow, type HostRow, Store, SubmitError } from "./store";
 
 export interface ServerOptions {
   dataDir: string;
@@ -34,6 +43,43 @@ interface Conn {
 }
 
 type Role = "admin" | "host";
+
+/** A job as the HTTP API reports it. */
+export interface JobInfo {
+  id: string;
+  state: JobState;
+  reason: string | null;
+  /** Why a waiting job has not been placed: a placement reason, `scheduled` or `dependency`. */
+  pending_reason: string | null;
+  cancel_requested: boolean;
+  project: string;
+  priority: number;
+  resources: Resources;
+  requires: string[];
+  begin_at: number | null;
+  depends: string[];
+  labels: Record<string, string>;
+  submitted_at: number;
+  updated_at: number;
+  /** The host holding the open attempt, if there is one. */
+  host: string | null;
+  result: StageResult[] | null;
+}
+
+/** A host as the HTTP API reports it. */
+export interface HostInfo extends HostRow {
+  fingerprint: string;
+  online: boolean;
+  reserved: Resources;
+  running: Array<{ attempt: number; job: string; state: AttemptRow["state"] }>;
+}
+
+/** How often the server re-runs placement and the webhook pump when no event prompts it. Also the resolution of a job's begin time. */
+const SCHEDULE_TICK_MS = 2000;
+/** How long one webhook delivery may take before it counts as failed and is retried. */
+const WEBHOOK_TIMEOUT_MS = 10_000;
+/** How often an idle event stream sends a comment line, so proxies keep the connection open. */
+const SSE_KEEPALIVE_MS = 20_000;
 
 export function fingerprint(pubkey: string): string {
   return createHash("sha256").update(Buffer.from(pubkey, "base64")).digest("hex").slice(0, 16);
@@ -83,7 +129,8 @@ export class CnocServer {
       idleTimeout: 255,
       fetch: (req, server) => this.fetch(req, server),
       websocket: {
-        open: (ws) => this.send(ws, { t: "challenge", nonce: ws.data.nonce, version: this.version, protocol: PROTOCOL }),
+        open: (ws) =>
+          this.send(ws, { t: "challenge", nonce: ws.data.nonce, version: this.version, protocol: PROTOCOL }),
         message: (ws, raw) => {
           try {
             this.onMessage(ws, JSON.parse(String(raw)) as ClientMsg);
@@ -96,9 +143,10 @@ export class CnocServer {
     });
     // No host is connected yet, so nothing handed out before the restart can be in flight.
     // A host that did start one re-adopts it when it syncs.
-    for (const a of this.store.openAttempts()) if (a.state === "assigned") this.store.giveBack(a.id, "server-restarted");
+    for (const a of this.store.openAttempts())
+      if (a.state === "assigned") this.store.giveBack(a.id, "server-restarted");
     this.store.onEvent(() => this.kick());
-    this.timers.push(setInterval(() => this.kick(), 2000));
+    this.timers.push(setInterval(() => this.kick(), SCHEDULE_TICK_MS));
     this.kick();
     return this;
   }
@@ -204,37 +252,68 @@ export class CnocServer {
   }
 
   private onMessage(ws: ServerWebSocket<Conn>, msg: ClientMsg): void {
-    if (msg.t === "hello") return this.onHello(ws, msg);
+    if (msg.t === "hello") {
+      this.onHello(ws, msg);
+      return;
+    }
     const host = ws.data.host;
-    if (!host) return ws.close(1008, "hello first");
+    if (!host) {
+      ws.close(1008, "hello first");
+      return;
+    }
     switch (msg.t) {
-      case "sync":
-        return this.onSync(ws, host, msg);
-      case "status":
-        return this.store.measured(host, msg.measured as Measured);
+      case "sync": {
+        this.onSync(ws, host, msg);
+        return;
+      }
+      case "status": {
+        this.store.measured(host, msg.measured as Measured);
+        return;
+      }
       case "decline":
-        this.backoff.set(`${this.store.attempt(msg.attempt)?.job}\n${host}`, Date.now() + (this.opts.declineBackoffS ?? 60) * 1000);
-        return this.store.giveBack(msg.attempt, `declined: ${msg.reason}`);
+        this.backoff.set(
+          `${this.store.attempt(msg.attempt)?.job}\n${host}`,
+          Date.now() + (this.opts.declineBackoffS ?? 60) * 1000,
+        );
+        {
+          this.store.giveBack(msg.attempt, `declined: ${msg.reason}`);
+          return;
+        }
       case "started":
-        if (this.store.started(msg.attempt, host) === "stale") this.send(ws, { t: "cancel", attempt: msg.attempt, reason: "not-yours" });
+        if (this.store.started(msg.attempt, host) === "stale")
+          this.send(ws, { t: "cancel", attempt: msg.attempt, reason: "not-yours" });
         else if (this.store.job(this.store.attempt(msg.attempt)?.job ?? "")?.cancel_requested)
           this.send(ws, { t: "cancel", attempt: msg.attempt, reason: "cancelled" });
         return;
       case "progress": {
         const a = this.store.attempt(msg.attempt);
         if (a && a.host === host && a.state === "running")
-          this.store.emit("attempt.progress", { job: a.job, attempt: a.id, host, data: { stage: msg.stage, note: msg.note } });
+          this.store.emit("attempt.progress", {
+            job: a.job,
+            attempt: a.id,
+            host,
+            data: { stage: msg.stage, note: msg.note },
+          });
         return;
       }
       case "ended":
         this.store.ended(msg, host);
-        return this.send(ws, { t: "ack", attempt: msg.attempt });
+        {
+          this.send(ws, { t: "ack", attempt: msg.attempt });
+          return;
+        }
     }
   }
 
   private onHello(ws: ServerWebSocket<Conn>, msg: Extract<ClientMsg, { t: "hello" }>): void {
-    if (msg.protocol !== PROTOCOL || msg.version !== this.version) return ws.close(1008, "version mismatch");
-    if (!/^[A-Za-z0-9._-]{1,64}$/.test(msg.name)) return ws.close(1008, "bad host name");
+    if (msg.protocol !== PROTOCOL || msg.version !== this.version) {
+      ws.close(1008, "version mismatch");
+      return;
+    }
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(msg.name)) {
+      ws.close(1008, "bad host name");
+      return;
+    }
     let ok = false;
     try {
       const key = createPublicKey({ key: Buffer.from(msg.pubkey, "base64"), format: "der", type: "spki" });
@@ -242,13 +321,20 @@ export class CnocServer {
     } catch {
       ok = false;
     }
-    if (!ok) return ws.close(1008, "bad signature");
+    if (!ok) {
+      ws.close(1008, "bad signature");
+      return;
+    }
     let host = this.store.host(msg.name);
-    if (host && host.pubkey !== msg.pubkey) return ws.close(1008, "host name is enrolled with a different key");
+    if (host && host.pubkey !== msg.pubkey) {
+      ws.close(1008, "host name is enrolled with a different key");
+      return;
+    }
     if (!host) host = this.store.enroll(msg.name, msg.pubkey, this.opts.openEnrollment === true);
     if (host.status !== "approved") {
       this.send(ws, { t: "pending", fingerprint: fingerprint(msg.pubkey) });
-      return ws.close(1008, "pending approval");
+      ws.close(1008, "pending approval");
+      return;
     }
     this.online.get(msg.name)?.close(4001, "replaced by a newer connection");
     ws.data.host = msg.name;
@@ -272,7 +358,8 @@ export class CnocServer {
     }
     for (const id of running) {
       if (this.store.started(id, host) === "stale") this.send(ws, { t: "cancel", attempt: id, reason: "not-yours" });
-      else if (this.store.job(this.store.attempt(id)?.job ?? "")?.cancel_requested) this.send(ws, { t: "cancel", attempt: id, reason: "cancelled" });
+      else if (this.store.job(this.store.attempt(id)?.job ?? "")?.cancel_requested)
+        this.send(ws, { t: "cancel", attempt: id, reason: "cancelled" });
     }
     this.store.emit("host.online", { host, data: { capacity: msg.capacity, features: msg.features } });
   }
@@ -284,7 +371,8 @@ export class CnocServer {
     for (const [token, name] of this.hostTokens) if (name === host) this.hostTokens.delete(token);
     if (!this.http) return;
     // Work the host never started goes back to the queue. Work it started stays with it.
-    for (const a of this.store.openAttempts(host)) if (a.state === "assigned") this.store.giveBack(a.id, "host-disconnected");
+    for (const a of this.store.openAttempts(host))
+      if (a.state === "assigned") this.store.giveBack(a.id, "host-disconnected");
     this.store.emit("host.offline", { host });
   }
 
@@ -301,9 +389,13 @@ export class CnocServer {
             const sig = createHmac("sha256", sub.secret).update(body).digest("hex");
             const res = await fetch(sub.url, {
               method: "POST",
-              headers: { "content-type": "application/json", "x-cnoc-seq": String(ev.seq), "x-cnoc-signature": `sha256=${sig}` },
+              headers: {
+                "content-type": "application/json",
+                "x-cnoc-seq": String(ev.seq),
+                "x-cnoc-signature": `sha256=${sig}`,
+              },
               body,
-              signal: AbortSignal.timeout(10_000),
+              signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
             }).catch(() => null);
             // Delivery is in order and at least once: stop at the first failure and retry later.
             if (!res?.ok) break;
@@ -327,7 +419,7 @@ export class CnocServer {
     return host ? { role: "host", actor: `host:${host}` } : null;
   }
 
-  private jobView(id: string): unknown {
+  private jobView(id: string): JobInfo | null {
     const j = this.store.job(id);
     if (!j) return null;
     return {
@@ -346,11 +438,11 @@ export class CnocServer {
       submitted_at: j.submitted_at,
       updated_at: j.updated_at,
       host: this.store.openAttempt(j.id)?.host ?? null,
-      result: j.result,
+      result: j.result as StageResult[] | null,
     };
   }
 
-  private hostsView(): unknown[] {
+  private hostsView(): HostInfo[] {
     const reserved = this.store.reserved();
     return this.store.hosts().map((h) => ({
       ...h,
@@ -369,7 +461,8 @@ export class CnocServer {
     try {
       if (path === "/v1/health") return J({ ok: true, version: this.version, protocol: PROTOCOL });
       if (path === "/v1/client") {
-        if (server.upgrade(req, { data: { nonce: randomBytes(16).toString("base64url"), host: null } })) return undefined;
+        if (server.upgrade(req, { data: { nonce: randomBytes(16).toString("base64url"), host: null } }))
+          return undefined;
         return J({ error: "expected a websocket upgrade" }, 400);
       }
       const who = this.role(req);
@@ -386,9 +479,12 @@ export class CnocServer {
       switch (route) {
         case "POST /v1/jobs": {
           const ct = req.headers.get("content-type") ?? "";
-          const sent = ct.includes("json") ? ((await req.json()) as { jobs: string[]; overrides?: Overrides }) : { jobs: [await req.text()] };
+          const sent = ct.includes("json")
+            ? ((await req.json()) as { jobs: string[]; overrides?: Overrides })
+            : { jobs: [await req.text()] };
           const bodies = sent.jobs;
-          if (!Array.isArray(bodies) || bodies.some((b) => typeof b !== "string")) throw new SubmitError("expected { jobs: string[] }");
+          if (!Array.isArray(bodies) || bodies.some((b) => typeof b !== "string"))
+            throw new SubmitError("expected { jobs: string[] }");
           const jobs = this.store.submit(bodies, who.actor, sent.overrides ?? {});
           return J({ jobs, seq: this.store.seq() });
         }
@@ -405,13 +501,19 @@ export class CnocServer {
         case "GET /v1/job": {
           const view = this.jobView(id());
           if (!view) return J({ error: "no such job" }, 404);
-          return J({ as_of: this.store.seq(), job: view, body: this.store.job(id())?.body, attempts: this.store.attemptsOf(id()) });
+          return J({
+            as_of: this.store.seq(),
+            job: view,
+            body: this.store.job(id())?.body,
+            attempts: this.store.attemptsOf(id()),
+          });
         }
         case "POST /v1/job/cancel": {
           const { job, attempt } = this.store.cancel(id(), who.actor);
           if (attempt) {
             const ws = this.online.get(attempt.host);
-            if (ws && attempt.state === "running") this.send(ws, { t: "cancel", attempt: attempt.id, reason: "cancelled" });
+            if (ws && attempt.state === "running")
+              this.send(ws, { t: "cancel", attempt: attempt.id, reason: "cancelled" });
             else if (attempt.state === "assigned") this.store.giveBack(attempt.id, "cancelled");
           }
           return J({ job: this.jobView(job.id), seq: this.store.seq() });
@@ -419,7 +521,10 @@ export class CnocServer {
         case "POST /v1/job/requeue":
           return J({ job: this.jobView(this.store.requeue(id(), who.actor).id), seq: this.store.seq() });
         case "POST /v1/job/priority":
-          return J({ job: this.jobView(this.store.setPriority(id(), Number(q.get("value") ?? Number.NaN), who.actor).id), seq: this.store.seq() });
+          return J({
+            job: this.jobView(this.store.setPriority(id(), Number(q.get("value") ?? Number.NaN), who.actor).id),
+            seq: this.store.seq(),
+          });
         case "GET /v1/templates":
           return J({ templates: this.store.templates().map((t) => ({ ...t, body: undefined })) });
         case "POST /v1/templates": {
@@ -435,11 +540,18 @@ export class CnocServer {
         }
         case "DELETE /v1/template":
           admin();
-          return J({ template: { ...this.store.templateRemove(q.get("ref") ?? "", q.get("path") ?? undefined, who.actor), body: undefined }, seq: this.store.seq() });
+          return J({
+            template: {
+              ...this.store.templateRemove(q.get("ref") ?? "", q.get("path") ?? undefined, who.actor),
+              body: undefined,
+            },
+            seq: this.store.seq(),
+          });
         case "POST /v1/template/run": {
           const b = (await req.json().catch(() => ({}))) as { set?: Record<string, string>; overrides?: Overrides };
           const set = b.set ?? {};
-          if (typeof set !== "object" || Object.values(set).some((v) => typeof v !== "string")) throw new SubmitError("expected { set: { NAME: value } }");
+          if (typeof set !== "object" || Object.values(set).some((v) => typeof v !== "string"))
+            throw new SubmitError("expected { set: { NAME: value } }");
           const r = this.store.templateRun(q.get("ref") ?? "", set, b.overrides ?? {}, who.actor);
           return J({ job: this.jobView(r.job), template: { ...r.template, body: undefined }, seq: this.store.seq() });
         }
@@ -467,7 +579,10 @@ export class CnocServer {
             version: this.version,
             pools: this.poolState(),
             hosts: this.hostsView(),
-            jobs: this.store.jobs().filter((j) => !TERMINAL.includes(j.state)).map((j) => this.jobView(j.id)),
+            jobs: this.store
+              .jobs()
+              .filter((j) => !TERMINAL.includes(j.state))
+              .map((j) => this.jobView(j.id)),
           });
         case "GET /v1/events": {
           const after = Number(q.get("after") ?? 0);
@@ -538,7 +653,7 @@ export class CnocServer {
         };
         flush();
         off = this.store.onEvent(flush);
-        keepalive = setInterval(() => ctl.enqueue(enc.encode(": keepalive\n\n")), 20_000);
+        keepalive = setInterval(() => ctl.enqueue(enc.encode(": keepalive\n\n")), SSE_KEEPALIVE_MS);
       },
       cancel: () => {
         off();

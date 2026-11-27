@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Pre-push hook: the local gate. The static checks, then the whole test suite.
+# See pre-commit for the ladder and for why the git variables are unset.
+
+set -euo pipefail
+
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_PREFIX GIT_NAMESPACE GIT_QUARANTINE_PATH
+
+exec bun run am-i-done --pre-push
