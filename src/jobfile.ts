@@ -341,13 +341,10 @@ function frontLine(lines: string[], name: string): number {
  * even when the rest of the template no longer fills with these arguments. null when it has none.
  */
 export function declaredKey(text: string, set: Record<string, string>): string | null {
-  const lines = text.split(/\r?\n/);
-  const at = frontLine(lines, "key");
-  if (at < 0) return null;
+  const k = writtenKey(text);
+  if (!k) return null;
+  const { written, line } = k;
   const args = new Map(argLines(text).map((a) => [a.name, a]));
-  // The line is read as written before anything is filled in, so an argument's value can
-  // never end the key early with a ` #` or a quote.
-  const written = keyText((lines[at] as string).replace(frontKey("key"), "").trim(), at + 1);
   const filled = written.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => {
     const a = args.get(name);
     if (!a) return whole;
@@ -356,8 +353,20 @@ export function declaredKey(text: string, set: Record<string, string>): string |
     if (/[\r\n]/.test(v)) throw new JobfileError(`argument ${name} must be a single line`);
     return v;
   });
-  if (filled === "") throw new JobfileError("key is empty", at + 1);
+  if (filled === "") throw new JobfileError("key is empty", line);
   return filled;
+}
+
+/**
+ * The `key:` line's value as the template writes it, arguments unfilled, and its line number.
+ * It is read before anything is filled in, so an argument's value can never end the key early
+ * with a ` #` or a quote. null when the template declares no key.
+ */
+export function writtenKey(text: string): { written: string; line: number } | null {
+  const lines = text.split(/\r?\n/);
+  const at = frontLine(lines, "key");
+  if (at < 0) return null;
+  return { written: keyText((lines[at] as string).replace(frontKey("key"), "").trim(), at + 1), line: at + 1 };
 }
 
 /**
@@ -379,20 +388,43 @@ function keyText(raw: string, line: number): string {
 }
 
 const KEY_RE = /^[A-Za-z0-9._#-]+(\/[A-Za-z0-9._#-]+)*$/;
+/** What an argument without a default stands for when a template's key is checked: valid in a key, and not a digit. */
+const KEY_STAND_IN = "x";
+
+/** How a key error names the key and what it suggests. */
+export interface KeyContext {
+  /** Shown for the key instead of its value: the template's own text, say. */
+  shown?: string;
+  /** The line the key is on. */
+  line?: number;
+  /** How to fix an all-digit key. */
+  digitsFix?: string;
+}
 
 /** The id of a keyed run: `<name>/<key>`. The key may contain `/`; the whole must be a valid job id. */
-export function keyedId(name: string, key: string): string {
+export function keyedId(name: string, key: string, ctx: KeyContext = {}): string {
   const id = `${name}/${key}`;
+  const shown = ctx.shown ?? JSON.stringify(key);
   if (!KEY_RE.test(key) || !ID_RE.test(id) || id.length > 200)
     throw new JobfileError(
-      `key ${JSON.stringify(key)} is not a valid id segment: it must match ${KEY_RE.source} and make an id of at most 200 characters`,
+      `key ${shown} is not a valid id segment: it must match ${KEY_RE.source} and make an id of at most 200 characters`,
+      ctx.line,
     );
   // Numbered runs are exactly the all-digit ids, so a key never names one.
   if (/^\d+$/.test(key))
-    throw new JobfileError(`key ${JSON.stringify(key)} is all digits, which are the numbers of unkeyed runs`);
+    throw new JobfileError(
+      `key ${shown} is all digits, which are the numbers of unkeyed runs; ${ctx.digitsFix ?? "give it a prefix, as in issue-1234"}`,
+      ctx.line,
+    );
   if (key.split("/").some((p) => p === "." || p === ".."))
-    throw new JobfileError(`key ${JSON.stringify(key)} has a . or .. segment`);
+    throw new JobfileError(`key ${shown} has a . or .. segment`, ctx.line);
   return id;
+}
+
+/** What a run whose template-declared key comes out all digits is told to do. */
+export function prefixKeyFix(template: string, text: string): string {
+  const written = writtenKey(text)?.written;
+  return `prefix the key in template ${template}${written === undefined ? "" : `, as in key: run-${written}`}`;
 }
 
 /** Replaces the id in a Jobfile's front matter. */
@@ -429,8 +461,18 @@ export function checkTemplate(text: string): { name: string; args: TemplateArg[]
   // Arguments without a default are tried as "1", which is a valid name, count and duration.
   const trial = Object.fromEntries(args.filter((a) => a.default === null).map((a) => [a.name, "1"]));
   const name = parseJob(fill(text, trial).text).id;
-  const key = declaredKey(text, trial);
-  if (key !== null) keyedId(name, key);
+  // In the key they are tried as "x" instead: with "1", `key: ${ISSUE}` would look all digits,
+  // which only some values make it. A run with such a value is refused then.
+  const keyTrial = Object.fromEntries(Object.keys(trial).map((n) => [n, KEY_STAND_IN]));
+  const key = declaredKey(text, keyTrial);
+  const written = writtenKey(text);
+  if (key !== null && written)
+    keyedId(name, key, {
+      // Named as the template writes it, so an error never shows the stand-in.
+      shown: JSON.stringify(written.written),
+      line: written.line,
+      digitsFix: prefixKeyFix(name, text),
+    });
   return { name, args };
 }
 

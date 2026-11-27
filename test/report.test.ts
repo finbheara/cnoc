@@ -9,7 +9,16 @@ import { specTempDir } from "../scripts/testkit";
 import { AttemptRunner, type AttemptState, REPORT } from "../src/client/runner";
 import type { PaneStatus, Tmux } from "../src/client/tmux";
 import type { JobSpec, StageResult, Usage } from "../src/protocol";
-import { HANDOFF, parseHandoff, readResult, reportedFields, wrongStage } from "../src/report";
+import {
+  HANDOFF,
+  ReportError,
+  local,
+  parseHandoff,
+  readResult,
+  reportedFields,
+  retryBudget,
+  wrongStage,
+} from "../src/report";
 import { STANDARD_TOTAL, standardSession } from "./transcript-fixture";
 
 const root = specTempDir("cnoc-report-");
@@ -144,10 +153,125 @@ test("a FIFO in place of a transcript neither hangs a report nor a snapshot", as
     code: 0,
   });
   // A report still goes out: here it fails only because there is no client on the socket.
-  const env = { CNOC_SOCK: join(root, "no-such-sock"), CNOC_TOKEN: "t", CNOC_STAGE: "1", CLAUDE_CONFIG_DIR: config };
+  const env = {
+    CNOC_SOCK: join(root, "no-such-sock"),
+    CNOC_TOKEN: "t",
+    CNOC_STAGE: "1",
+    CLAUDE_CONFIG_DIR: config,
+    CNOC_REPORT_WAIT_MS: "0",
+  };
   const done = await cli(["done", "ok"], { ...env, CLAUDE_CODE_SESSION_ID: "fifo-sess" });
   expect(done.code).toBe(1);
   expect(done.err).toStartWith(`cnoc: cannot reach ${env.CNOC_SOCK}`);
+});
+
+// ---- reaching a client that is restarting ------------------------------------
+
+/** Runs `fn` with CNOC_SOCK and CNOC_TOKEN pointing at `sock`, as inside a job. */
+async function inJob<T>(sock: string, fn: () => Promise<T>): Promise<T> {
+  const saved = { sock: process.env.CNOC_SOCK, token: process.env.CNOC_TOKEN };
+  process.env.CNOC_SOCK = sock;
+  process.env.CNOC_TOKEN = "t";
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of [
+      ["CNOC_SOCK", saved.sock],
+      ["CNOC_TOKEN", saved.token],
+    ] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test("a report retries until the client's socket answers, saying once that it waits", async () => {
+  const sock = join(root, "late.sock");
+  let clock = 0;
+  let pauses = 0;
+  let server: ReturnType<typeof Bun.serve> | null = null;
+  const said: string[] = [];
+  const r = await inJob(sock, () =>
+    local<{ accepted: boolean }>(
+      "/attempt/result",
+      {},
+      {
+        ms: 10_000,
+        everyMs: 1000,
+        waiting: (l) => said.push(l),
+        now: () => clock,
+        // The client comes back during the third pause.
+        sleep: async (ms) => {
+          clock += ms;
+          if (++pauses === 3) server = Bun.serve({ unix: sock, fetch: () => Response.json({ accepted: true }) });
+        },
+      },
+    ),
+  );
+  await (server as ReturnType<typeof Bun.serve> | null)?.stop(true);
+  expect(r).toEqual({ accepted: true });
+  expect(pauses).toBe(3);
+  expect(said).toHaveLength(1);
+  expect(said[0]).toContain("may be restarting");
+});
+
+test("a report gives up when its time is up, and an HTTP answer of any status is final", async () => {
+  const sock = join(root, "gone.sock");
+  let clock = 0;
+  const tries = { n: 0 };
+  const wait = {
+    ms: 5000,
+    everyMs: 2000,
+    now: () => clock,
+    sleep: async (ms: number) => {
+      clock += ms;
+      tries.n++;
+    },
+  };
+  const gone = await inJob(sock, () => local("/attempt/result", {}, wait)).catch((e: Error) => e);
+  expect(gone).toBeInstanceOf(ReportError);
+  expect((gone as Error).message).toStartWith(`cannot reach ${sock}`);
+  expect((gone as Error).message).toEndWith("(still, after 5s of trying)");
+  expect(tries.n).toBe(3); // 2s, 2s, then the last 1s
+
+  tries.n = 0;
+  const once = await inJob(sock, () => local("/attempt/result", {})).catch((e: Error) => e);
+  expect((once as Error).message).not.toContain("still");
+  expect(tries.n).toBe(0);
+
+  const server = Bun.serve({ unix: sock, fetch: () => Response.json({ error: "busy" }, { status: 503 }) });
+  try {
+    const answered = await inJob(sock, () => local("/attempt/result", {}, wait)).catch((e: Error) => e);
+    expect((answered as Error).message).toBe("busy");
+    expect(tries.n).toBe(0);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("CNOC_REPORT_WAIT_MS lowers the retry budget and never raises it", () => {
+  expect(retryBudget(90_000, {})).toBe(90_000);
+  expect(retryBudget(90_000, { CNOC_REPORT_WAIT_MS: "0" })).toBe(0);
+  expect(retryBudget(90_000, { CNOC_REPORT_WAIT_MS: "999999" })).toBe(90_000);
+  expect(retryBudget(90_000, { CNOC_REPORT_WAIT_MS: "soon" })).toBe(90_000);
+});
+
+test("cnoc done tells the agent once that it is waiting for the client", async () => {
+  const env = { CNOC_SOCK: join(root, "no-client"), CNOC_TOKEN: "t", CNOC_REPORT_WAIT_MS: "1" };
+  const r = await cli(["done", "ok"], env);
+  expect(r.code).toBe(1);
+  const lines = r.err.trim().split("\n");
+  expect(lines).toHaveLength(2);
+  expect(lines[0]).toContain("may be restarting");
+  expect(lines[1]).toStartWith(`cnoc: cannot reach ${env.CNOC_SOCK}`);
+  // `cnoc progress` is disposable: one try, no waiting, whatever the budget.
+  const { CNOC_REPORT_WAIT_MS: _, ...unlimited } = env;
+  const note = await cli(["progress", "step"], unlimited);
+  expect(note.code).toBe(1);
+  expect(note.err).toStartWith(`cnoc: cannot reach ${env.CNOC_SOCK}`);
+  expect(note.err.trim().split("\n")).toHaveLength(1);
+  // `cnoc usage` runs from a hook on every turn: it never waits and never speaks.
+  expect(await cli(["usage"], unlimited)).toEqual({ out: "", err: "", code: 0 });
 });
 
 test("cnoc handoff refuses a bad status before it looks for a job", async () => {

@@ -3,7 +3,16 @@
  * job named `<template>/<n>` from a counter, or `<template>/<key>` when the run has a key.
  */
 import type { Database } from "bun:sqlite";
-import { JobfileError, type TemplateArg, checkTemplate, declaredKey, fill, keyedId, withId } from "../jobfile";
+import {
+  JobfileError,
+  type TemplateArg,
+  checkTemplate,
+  declaredKey,
+  fill,
+  keyedId,
+  prefixKeyFix,
+  withId,
+} from "../jobfile";
 import type { JobState, Overrides } from "../protocol";
 import { SubmitError } from "./errors";
 
@@ -151,7 +160,8 @@ export function runTemplate(
     const given = opts.key;
     const declared = given === undefined ? refuse(() => declaredKey(t.body, set)) : null;
     const key = given ?? declared;
-    let job = key === null ? null : refuse(() => keyedId(t.name, key));
+    const fix = given === undefined ? { digitsFix: prefixKeyFix(t.name, t.body) } : {};
+    let job = key === null ? null : refuse(() => keyedId(t.name, key, fix));
     const before = job === null ? null : existing(job);
     if (before) return before;
     if (job === null && opts.keyed)

@@ -18,7 +18,7 @@ import type {
   StageResult,
 } from "../protocol";
 import { PROTOCOL, TERMINAL, impliedFeatures } from "../protocol";
-import { SAFE_VERSION, printable, runningVersion, runningVersionProblem } from "../version";
+import { INVALID_VERSION, SAFE_VERSION, printable, runningVersion, runningVersionProblem } from "../version";
 import { type HostView, type Policy, type QueuedJob, defaultPolicy, schedule } from "./scheduler";
 import { type AttemptRow, type HostRow, Store, SubmitError } from "./store";
 
@@ -355,7 +355,7 @@ export class CnocServer {
     }
     if (msg.version !== this.version) {
       // Signed by the approved key the name is bound to, so the note is the host's own; it is still made safe to print.
-      const version = typeof msg.version === "string" && SAFE_VERSION.test(msg.version) ? msg.version : "(invalid)";
+      const version = typeof msg.version === "string" && SAFE_VERSION.test(msg.version) ? msg.version : INVALID_VERSION;
       const note = typeof msg.update === "string" ? printable(msg.update, 300) : null;
       this.mismatched.set(msg.name, { version, note, at: Date.now() });
       ws.close(1008, "version mismatch");
