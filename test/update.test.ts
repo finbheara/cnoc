@@ -439,11 +439,53 @@ test("a record the previous version wrote is read without its restarts counting,
   old({ reason: "5 restarts for updates in the last hour; is the server's version changing back and forth?" });
   const held = updater(clone, state, clock, { version: commits[0] as string });
   expect(held.u.dueIn(commits[1] as string)).toBe(0);
-  // Nothing was restarted for that target, and nothing failed: the hello says only that it is updating.
-  expect(held.u.note(commits[1] as string)).toBe(`updating to ${shortVersion(commits[1])}`);
+  // It had restarted for that target, and says so; nothing failed.
+  expect(held.u.note(commits[1] as string)).toBe(
+    `restarted for ${shortVersion(commits[1])} but still runs ${shortVersion(commits[0])}; next try in 0s`,
+  );
+  // A dropped hold for a target it never restarted for claims no restart.
+  old({
+    reason: "5 restarts for updates in the last hour; is the server's version changing back and forth?",
+    restarted: false,
+  });
+  expect(updater(clone, state, clock, { version: commits[0] as string }).u.note(commits[1] as string)).toBe(
+    `updating to ${shortVersion(commits[1])}`,
+  );
   // Any other backoff it recorded is honoured as it was.
   old({ reason: "commit 0123456 is not on origin; was it pushed?" });
   expect(updater(clone, state, clock).u.dueIn(commits[1] as string)).toBe(20 * 60_000);
+});
+
+test("a dropped old-format hold for a target already restarted for never restarts again, even unwritable", async () => {
+  const { clone, commits } = fresh(2);
+  const target = commits[1] as string;
+  // The code for the target is in place, but this client still reports another version.
+  git(clone, "checkout", "-q", "--detach", target);
+  const state = specTempDir("cnoc-update-state-");
+  const clock = { t: 10_000_000 };
+  writeFileSync(
+    join(state, "update.json"),
+    JSON.stringify({
+      target,
+      tries: 2,
+      next_at: clock.t + 20 * 60_000,
+      reason: "5 restarts for updates in the last hour; is the server's version changing back and forth?",
+      restarted: true,
+      at: clock.t - 60_000,
+      restarts: [1, 2, 3, 4, 5].map((i) => clock.t - i * 60_000),
+    }),
+  );
+  // Read-only: each start reads the same old record, and its own record lives only in memory.
+  chmodSync(state, 0o500);
+  try {
+    for (let start = 0; start < 5; start++) {
+      const { u } = updater(clone, state, clock, { version: "still-wrong" });
+      expect(await u.attempt(target)).toBe(false);
+      clock.t += UPDATE_RETRY_MAX_MS;
+    }
+  } finally {
+    chmodSync(state, 0o700);
+  }
 });
 
 test("a configured command that leaves a git checkout short of the target is not trusted", async () => {

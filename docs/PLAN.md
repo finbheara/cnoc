@@ -4,7 +4,7 @@ What exists, what does not, and the order to build the rest. The design is in [S
 
 ## Built and tested
 
-Tested means covered by `bun test`: 198 tests of cnoc itself (the count `bun test test/` prints), 39 of them end to end: 34 with a real server, real clients and real tmux sessions, and 5 that run `cnoc feed` as its own process against a real server or a stand-in for an older one. One more runs `install.sh` in a temporary `HOME` against a local repository, without a service. And 274 specs of the gate.
+Tested means covered by `bun test`: 199 tests of cnoc itself (the count `bun test test/` prints), 39 of them end to end: 34 with a real server, real clients and real tmux sessions, and 5 that run `cnoc feed` as its own process against a real server or a stand-in for an older one. One more runs `install.sh` in a temporary `HOME` against a local repository, without a service. And 274 specs of the gate.
 
 | Area | What works |
 |---|---|

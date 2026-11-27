@@ -77,13 +77,15 @@ const LEGACY_HOLD = /restarts for updates in the last hour/;
 /**
  * A record as this version reads it. One written by the previous version has no `left`: its
  * restarts name no versions, so none of them counts as a return, and a hold it made for its
- * restart limit (which counted new deploys too) is dropped, so the target is tried at once as if new.
+ * restart limit (which counted new deploys too) is dropped, so the target is tried at once.
  */
 export function readState(raw: UpdateState): UpdateState {
   if (Array.isArray(raw.left)) return raw;
   const legacyHold = typeof raw.reason === "string" && LEGACY_HOLD.test(raw.reason);
-  // A dropped hold starts its target afresh: no tries, and no restart this version can vouch for.
-  const fresh = legacyHold ? { tries: 0, next_at: 0, reason: null, restarted: false } : {};
+  // A dropped hold starts its tries afresh, but keeps `restarted`: a host that already restarted
+  // for the target must not restart onto the same code again (on every start, if the record
+  // cannot be written).
+  const fresh = legacyHold ? { tries: 0, next_at: 0, reason: null } : {};
   return { ...raw, left: [], returns: [], ...fresh };
 }
 
