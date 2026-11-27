@@ -3,6 +3,10 @@
  * The wire protocol is the product; server and client are one implementation of it.
  */
 
+/**
+ * The version reported by code that is not a git checkout, or `CNOC_VERSION` when set. A
+ * checkout reports its commit instead: see `runningVersion()` in version.ts.
+ */
 export const VERSION: string = process.env.CNOC_VERSION ?? "0.1.0";
 /** Bumped on any incompatible change to the messages below. */
 export const PROTOCOL = 1;
@@ -93,7 +97,16 @@ export type ServerMsg =
 // ---- wire: client -> server ------------------------------------------------
 
 export type ClientMsg =
-  | { t: "hello"; name: string; pubkey: string; sig: string; version: string; protocol: number }
+  | {
+      t: "hello";
+      name: string;
+      pubkey: string;
+      sig: string;
+      version: string;
+      protocol: number;
+      /** Sent by a client on a different version: what it is doing about it. The server shows it and closes. */
+      update?: string;
+    }
   | {
       /** Full view, sent once after every (re)connect. The server reconciles against it. */
       t: "sync";

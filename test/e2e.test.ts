@@ -10,6 +10,8 @@ import { Tmux } from "../src/client/tmux";
 import type { ChangeEvent } from "../src/protocol";
 import { CnocServer, type HostInfo, type JobInfo } from "../src/server/server";
 import type { AttemptRow, TemplateRow } from "../src/server/store";
+import { versionOf } from "../src/version";
+import { commit, git, makeRepos } from "./git-fixture";
 
 // Every test here starts real tmux sessions and waits for a client and a server to agree about them,
 // so one test legitimately takes seconds. Each wait inside a test polls a condition (see `until`).
@@ -44,6 +46,8 @@ const newClient = (
     tmuxSocket: socket,
     pollMs: 100,
     log: quiet,
+    // Not a git checkout: a test that gets the versions wrong must never move this repository.
+    checkout: join(root, "not-a-checkout"),
     ...extra,
   });
 
@@ -337,7 +341,104 @@ test("a client on the wrong version updates itself and takes no work", async () 
   await until("update command to run and the client to exit", () => exitCode !== -1);
   expect(exitCode).toBe(75);
   expect(readFileSync(marker, "utf8").trim()).toBe(server.version);
-  expect((await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "delta")).toBeUndefined();
+  // The server knows the host by its signed hello, shows what it runs, and gave it nothing.
+  const delta = (await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "delta");
+  expect(delta).toMatchObject({ online: false, running: [], mismatch: { version: "0.0.1-old" } });
+  expect(delta?.mismatch?.note).toMatch(/^updating to /);
+});
+
+test("a server restarted on a new commit brings its client to it, and the session keeps running", async () => {
+  const { clone, commits } = makeRepos(specTempDir("cnoc-e2e-upgrade-"), 3);
+  // The server moves to the middle commit while main has already moved past it.
+  const [from, to] = commits as [string, string, string];
+  const dir = join(root, "data-upgrade");
+  let srv = await new CnocServer({ dataDir: dir, port: 0, openEnrollment: true, log: quiet, version: from }).start();
+  const port = srv.port;
+  const exits: number[] = [];
+  // What the service manager runs: the code in the checkout, whatever version that is now.
+  const service = () =>
+    new CnocClient({
+      config: { server: srv.url, name: "zeta", projects: { proj: project } },
+      stateDir: join(root, "state-zeta"),
+      tmuxSocket: socket,
+      pollMs: 100,
+      log: quiet,
+      checkout: clone,
+      version: versionOf(clone),
+      exit: (c) => exits.push(c),
+    });
+  let zeta = await service().start();
+  try {
+    const j = id("across-upgrade");
+    const go = `go-${seq}.txt`;
+    await api(
+      "POST",
+      "/v1/jobs",
+      { jobs: [job(j, `until [ -f ${go} ]; do sleep 0.1; done; cnoc done upgraded`)] },
+      srv,
+    );
+    await reaches(j, "running", srv);
+    const attempt = (await api("GET", `/v1/job?id=${encodeURIComponent(j)}`, undefined, srv)).attempts[0]?.id;
+
+    await srv.stop();
+    srv = await new CnocServer({ dataDir: dir, port, openEnrollment: true, log: quiet, version: to }).start();
+    await until("the client to update and exit", () => exits.length > 0);
+    expect(exits).toEqual([75]);
+    expect(git(clone, "rev-parse", "HEAD")).toBe(to);
+    expect(await new Tmux(socket).sessions()).toContain(`cnoc-${attempt}-0`);
+    const outdated = (await api("GET", "/v1/hosts", undefined, srv)).hosts.find((h) => h.name === "zeta");
+    expect(outdated?.mismatch).toMatchObject({ version: from, note: `updating to ${to.slice(0, 7)}` });
+
+    zeta = await service().start();
+    const back = await until("zeta back on the new version", async () =>
+      (await api("GET", "/v1/hosts", undefined, srv)).hosts.find((h) => h.name === "zeta" && h.online),
+    );
+    expect(back).toMatchObject({ version: to, mismatch: null });
+    writeFileSync(join(project, go), "");
+    expect((await reaches(j, "done", srv)).result).toEqual([{ status: "done", summary: "upgraded" }]);
+  } finally {
+    await zeta.stop();
+    await srv.stop();
+  }
+});
+
+test("a client that cannot reach the server's commit says why and does not restart", async () => {
+  const { origin, clone } = makeRepos(specTempDir("cnoc-e2e-unpushed-"), 1);
+  const elsewhere = join(origin, "..", "dev");
+  git(join(origin, ".."), "clone", "-q", origin, elsewhere);
+  const unpushed = commit(elsewhere, "code.txt", "never pushed\n");
+  const srv = await new CnocServer({
+    dataDir: join(root, "data-unpushed"),
+    port: 0,
+    openEnrollment: true,
+    log: quiet,
+    version: unpushed,
+  }).start();
+  const exits: number[] = [];
+  const eta = await new CnocClient({
+    config: { server: srv.url, name: "eta", projects: { proj: project } },
+    stateDir: join(root, "state-eta"),
+    tmuxSocket: socket,
+    pollMs: 100,
+    log: quiet,
+    checkout: clone,
+    version: versionOf(clone),
+    exit: (c) => exits.push(c),
+  }).start();
+  try {
+    const host = await until("the failure to reach the server", async () => {
+      const h = (await api("GET", "/v1/hosts", undefined, srv)).hosts.find((x) => x.name === "eta");
+      return h?.mismatch?.note?.includes("failed") ? h : null;
+    });
+    expect(host.online).toBe(false);
+    expect(host.mismatch?.note).toMatch(
+      /^update to \w{7} failed \(try 1\): commit \w{7} is not on origin; was it pushed\?; next try in \d+s$/,
+    );
+    expect(exits).toEqual([]);
+  } finally {
+    await eta.stop();
+    await srv.stop();
+  }
 });
 
 test("a second client cannot share a state directory", async () => {

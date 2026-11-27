@@ -4,11 +4,12 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CnocClient, loadClientConfig } from "./client/client";
 import { JobfileError, checkTemplate, declaresArgs, parseJob } from "./jobfile";
-import { type ChangeEvent, type Overrides, PROTOCOL, VERSION } from "./protocol";
+import { type ChangeEvent, type Overrides, PROTOCOL } from "./protocol";
 import { CnocServer, type HostInfo, type JobInfo, type ServerOptions } from "./server/server";
 import type { AttemptRow, TemplateRow } from "./server/store";
+import { runningVersion, shortVersion } from "./version";
 
-const HELP = `cnoc ${VERSION} - batch scheduling of agent harness sessions across persistent hosts
+const HELP = `cnoc - batch scheduling of agent harness sessions across persistent hosts
 
 Run the services
   cnoc server [--data DIR] [--port 7878] [--host 127.0.0.1] [--config FILE] [--open-enrollment]
@@ -37,7 +38,7 @@ When and where, for submit and template run
   --after DURATION                         not before this long from now: 90m, 2h
 
 Hosts
-  cnoc hosts [--json]
+  cnoc hosts [--json]                      with the version each runs and why one has not caught up
   cnoc hosts approve NAME | drain NAME | undrain NAME
   cnoc attach ATTEMPT [STAGE]              read-only view of a session on this host
 
@@ -216,8 +217,12 @@ async function main(): Promise<void> {
     case "-h":
       return console.log(HELP);
     case "version":
-    case "--version":
-      return console.log(`${VERSION} (protocol ${PROTOCOL})`);
+    case "--version": {
+      console.log(`cnoc ${runningVersion()} (protocol ${PROTOCOL})`);
+      const s = await api<{ version: string; protocol: number }>("GET", "/v1/health").catch(() => null);
+      if (s) console.log(`server ${s.version} (protocol ${s.protocol})`);
+      return;
+    }
 
     case "server": {
       const file =
@@ -432,19 +437,28 @@ async function main(): Promise<void> {
         return console.log(
           `approved ${(await api<{ host: { name: string } }>("POST", `/v1/host/approve?name=${encodeURIComponent(need(1, "NAME"))}`)).host.name}`,
         );
-      const r = await api<{ hosts: HostInfo[] }>("GET", "/v1/hosts");
+      const r = await api<{ version?: string; hosts: HostInfo[] }>("GET", "/v1/hosts");
       if (asJson) return console.log(JSON.stringify(r, null, 2));
+      console.log(`server ${shortVersion(r.version)}`);
       if (r.hosts.length === 0) return console.log("no hosts have connected");
-      const rows = [["HOST", "STATUS", "RUNNING", "RESERVED / CAPACITY", "LOAD", "KEY"]];
+      const rows = [["HOST", "STATUS", "VERSION", "RUNNING", "RESERVED / CAPACITY", "LOAD", "KEY"]];
+      const behind: string[] = [];
       for (const h of r.hosts) {
-        const status = h.status === "pending" ? "pending" : h.drained ? "drained" : h.online ? "online" : "offline";
+        const m = h.online ? null : h.mismatch;
+        if (m)
+          behind.push(`${h.name} runs ${shortVersion(m.version)}, ${age(m.at)} ago: ${m.note ?? "no update reported"}`);
+        const status =
+          h.status === "pending" ? "pending" : m ? "outdated" : h.drained ? "drained" : h.online ? "online" : "offline";
         const res = Object.keys(h.capacity)
           .map((n: string) => `${n} ${h.reserved[n] ?? 0}/${h.capacity[n]}`)
           .join(", ");
         const load = h.measured ? (h.measured.load1 / Math.max(1, h.measured.cpus)).toFixed(2) : "-";
-        rows.push([h.name, status, String(h.running.length), res || "-", load, h.fingerprint]);
+        const version = shortVersion(m?.version ?? h.version);
+        rows.push([h.name, status, version, String(h.running.length), res || "-", load, h.fingerprint]);
       }
-      return console.log(table(rows));
+      console.log(table(rows));
+      if (behind.length > 0) console.log(`\n${behind.join("\n")}`);
+      return;
     }
     case "drain":
     case "undrain": {

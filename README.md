@@ -24,6 +24,7 @@ The installer clones Cnoc to `~/.local/share/cnoc/app`, puts a `cnoc` command in
 
 - Repeat `--project NAME=PATH` for each checkout. `--resource gpu=1` offers a resource (default `slots=1`), and `--name` overrides the hostname.
 - Running it again updates the code and restarts the client. Running sessions are not interrupted, and the existing config is kept unless you pass `--force`.
+- You should not need to run it again to update. A client follows the server: see [Updates](#updates).
 - The service does not read your shell profile. It gets the `PATH` the installer saw; on Linux, put any other variables in `~/.config/cnoc/client.env`.
 - `--uninstall` removes the service and the code, and keeps the config and host key.
 
@@ -175,6 +176,15 @@ bun src/cli.ts server --host 0.0.0.0
 ```
 
 It prints where it wrote the admin token. Put TLS in front of it, or keep it on a private network; the server speaks plain HTTP. Keeping it running is up to you for now.
+
+### Updates
+
+Update the server and the clients follow. On the server: `git pull`, then restart it. Its version is the commit it runs, and a client on any other commit takes no work, fetches that exact commit from its own clone's `origin`, checks it out, installs dependencies and exits for its service manager to start the new code. Running sessions live in tmux and carry on; the restarted client picks them up.
+
+- The server must run a commit that is pushed to the repository the clients cloned. A server with uncommitted changes reports `COMMIT-dirty`, which no client can reach.
+- A client that cannot update (commit not pushed, network down, local changes in its clone) logs one line saying why and tries again after 1, 2, 4… minutes, at most every 30 minutes. A new server version is tried at once.
+- `cnoc hosts` shows the server's version and each host's, and for a host that has not caught up, what it last said about its update. `cnoc version` prints both versions.
+- Not a git checkout? Set `"update"` in the client config to a shell command; it runs with `CNOC_TARGET_VERSION` set. `CNOC_VERSION` overrides the version of either side.
 
 **Each host:** run the [installer](#install-a-client). The client generates a key on first start and waits to be approved. The config it writes looks like [examples/client.json](examples/client.json).
 

@@ -139,7 +139,6 @@ main() {
     CNOC_I_SERVER=$server CNOC_I_NAME=$name CNOC_I_OUT=$CONFIG \
       CNOC_I_PROJECTS=$(printf '%s\n' ${projects[@]+"${projects[@]}"}) \
       CNOC_I_RESOURCES=$(printf '%s\n' "${resources[@]}") \
-      CNOC_I_UPDATE="git -C '$APP' pull -q --ff-only && '$bun' install --cwd '$APP' --frozen-lockfile --production" \
       "$bun" -e '
         const { existsSync, writeFileSync } = require("node:fs");
         const pairs = (s) => (s || "").split("\n").filter(Boolean).map((l) => {
@@ -155,11 +154,23 @@ main() {
           if (!/^\d+$/.test(v)) { console.error(`error: resource ${n}: "${v}" is not a count`); process.exit(1); }
           return [n, Number(v)];
         }));
-        writeFileSync(e.CNOC_I_OUT, JSON.stringify({ server: e.CNOC_I_SERVER, name: e.CNOC_I_NAME, projects, resources, update: e.CNOC_I_UPDATE }, null, 2) + "\n");
+        writeFileSync(e.CNOC_I_OUT, JSON.stringify({ server: e.CNOC_I_SERVER, name: e.CNOC_I_NAME, projects, resources }, null, 2) + "\n");
       '
     say "wrote $CONFIG"
   else
     name=$("$bun" -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).name ?? "")' "$CONFIG")
+    # Older installers wrote an "update" command that pulls a branch; the client now updates itself
+    # to the server's exact commit and ignores that command, so it is removed to avoid confusion.
+    "$bun" -e '
+      const fs = require("node:fs");
+      const f = process.argv[1];
+      const cfg = JSON.parse(fs.readFileSync(f, "utf8"));
+      if (/^git -C .* pull -q --ff-only && .* install --cwd .* --frozen-lockfile --production$/.test(cfg.update ?? "")) {
+        delete cfg.update;
+        fs.writeFileSync(f, JSON.stringify(cfg, null, 2) + "\n");
+        console.log("==> removed the old update command from " + f);
+      }
+    ' "$CONFIG"
     say "kept $CONFIG"
   fi
 

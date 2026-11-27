@@ -17,7 +17,8 @@ import type {
   ServerMsg,
   StageResult,
 } from "../protocol";
-import { PROTOCOL, TERMINAL, VERSION, impliedFeatures } from "../protocol";
+import { PROTOCOL, TERMINAL, impliedFeatures } from "../protocol";
+import { runningVersion } from "../version";
 import { type HostView, type Policy, type QueuedJob, defaultPolicy, schedule } from "./scheduler";
 import { type AttemptRow, type HostRow, Store, SubmitError } from "./store";
 
@@ -72,6 +73,16 @@ export interface HostInfo extends HostRow {
   online: boolean;
   reserved: Resources;
   running: Array<{ attempt: number; job: string; state: AttemptRow["state"] }>;
+  /** Set while the host's last contact was refused for running another version. */
+  mismatch: Mismatch | null;
+}
+
+/** What a host on another version said when it last tried to connect. */
+export interface Mismatch {
+  version: string;
+  /** The host's own account of its update, such as why it failed. */
+  note: string | null;
+  at: number;
 }
 
 /** How often the server re-runs placement and the webhook pump when no event prompts it. Also the resolution of a job's begin time. */
@@ -94,6 +105,8 @@ export class CnocServer {
   private hostTokens = new Map<string, string>();
   private backoff = new Map<string, number>();
   private pending: Record<string, string> = {};
+  /** Hosts whose last contact was refused for their version. In memory: a restart starts over. */
+  private mismatched = new Map<string, Mismatch>();
   private policy: Policy = defaultPolicy;
   private timers: Timer[] = [];
   private dirty = false;
@@ -103,7 +116,7 @@ export class CnocServer {
   constructor(private opts: ServerOptions) {
     mkdirSync(opts.dataDir, { recursive: true });
     this.store = new Store(join(opts.dataDir, "cnoc.sqlite"));
-    this.version = opts.version ?? VERSION;
+    this.version = opts.version ?? runningVersion();
     this.log = opts.log ?? ((l) => console.log(`[server] ${l}`));
     const tokenFile = join(opts.dataDir, "admin.token");
     if (!existsSync(tokenFile)) writeFileSync(tokenFile, `${randomBytes(24).toString("base64url")}\n`, { mode: 0o600 });
@@ -306,7 +319,7 @@ export class CnocServer {
   }
 
   private onHello(ws: ServerWebSocket<Conn>, msg: Extract<ClientMsg, { t: "hello" }>): void {
-    if (msg.protocol !== PROTOCOL || msg.version !== this.version) {
+    if (msg.protocol !== PROTOCOL) {
       ws.close(1008, "version mismatch");
       return;
     }
@@ -331,11 +344,19 @@ export class CnocServer {
       return;
     }
     if (!host) host = this.store.enroll(msg.name, msg.pubkey, this.opts.openEnrollment === true);
+    if (msg.version !== this.version) {
+      // Signed by the key the name is bound to, so the note is the host's own.
+      const note = typeof msg.update === "string" ? msg.update.slice(0, 500) : null;
+      this.mismatched.set(msg.name, { version: String(msg.version).slice(0, 100), note, at: Date.now() });
+      ws.close(1008, "version mismatch");
+      return;
+    }
     if (host.status !== "approved") {
       this.send(ws, { t: "pending", fingerprint: fingerprint(msg.pubkey) });
       ws.close(1008, "pending approval");
       return;
     }
+    this.mismatched.delete(msg.name);
     this.online.get(msg.name)?.close(4001, "replaced by a newer connection");
     ws.data.host = msg.name;
     this.online.set(msg.name, ws);
@@ -450,6 +471,7 @@ export class CnocServer {
       online: this.online.has(h.name),
       reserved: reserved.get(h.name) ?? {},
       running: this.store.openAttempts(h.name).map((a: AttemptRow) => ({ attempt: a.id, job: a.job, state: a.state })),
+      mismatch: this.mismatched.get(h.name) ?? null,
     }));
   }
 
@@ -566,7 +588,7 @@ export class CnocServer {
           return J({ job: this.jobView(id()), seq: this.store.seq() });
         }
         case "GET /v1/hosts":
-          return J({ as_of: this.store.seq(), hosts: this.hostsView() });
+          return J({ as_of: this.store.seq(), version: this.version, hosts: this.hostsView() });
         case "POST /v1/host/approve":
           admin();
           return J({ host: this.store.approve(q.get("name") ?? "", who.actor) });

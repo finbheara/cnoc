@@ -4,7 +4,7 @@ What exists, what does not, and the order to build the rest. The design is in [S
 
 ## Built and tested
 
-Tested means covered by `bun test`: 78 tests of cnoc itself, 25 of them end to end with a real server, real clients and real tmux sessions, and 274 specs of the gate.
+Tested means covered by `bun test`: 94 tests of cnoc itself, 27 of them end to end with a real server, real clients and real tmux sessions, and 274 specs of the gate.
 
 | Area | What works |
 |---|---|
@@ -15,7 +15,7 @@ Tested means covered by `bun test`: 78 tests of cnoc itself, 25 of them end to e
 | Client | Outbound WebSocket with reconnect, key generation and enrollment, resource and load reporting, local socket for the harness, on-disk outbox. |
 | Reconciliation | Client restart re-adopts sessions; results produced while the server was down are delivered later; vanished sessions and abandoned jobs are resolved. |
 | Changelog | Numbered events, paging and long-poll, server-sent events, signed in-order webhooks, `/v1/state` snapshot. |
-| Updates | A client on the wrong version takes no work, runs its update command and exits for its service manager. |
+| Updates | The version is the commit a process runs. A client on another version takes no work, checks out exactly the server's commit from its clone's `origin` and exits for its service manager; failures back off across restarts, and `cnoc hosts` shows each host's version and why it has not caught up. |
 | Git intake | `cnoc ingest` of a checkout's `jobs/` directory. |
 | Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. |
 | When and where | `begin` (a time or a delay), `--on HOST` through a `host/NAME` feature, priority at submit and on a waiting job. |
@@ -40,7 +40,7 @@ In rough order of value.
 ### 1. Make it installable
 
 - **Server install.** The client has an installer; the server is a clone and a command you keep running yourself.
-- **Launcher and payload split.** A small, rarely changing launcher that fetches a pinned version, verifies its hash and starts it. Today `update` is whatever shell command the host config names, which is only as safe as that command.
+- **Launcher and payload split.** A small, rarely changing launcher that fetches a pinned version, verifies its hash and starts it. Today the update is built in: it checks out the commit the server names from the clone's own `origin`, so it is as safe as that repository and the server's choice of commit within it. Nothing verifies a signature, and the update code that runs is the old version's, so a broken update procedure has to be fixed by hand once.
 - **Published package**, so a host does not need a clone.
 - **TLS** in the server, or a documented reverse-proxy setup.
 
@@ -93,5 +93,5 @@ Brought across without these parts of the gate it was taken from:
 
 - **How long may a session sit idle?** A harness waiting at its prompt after finishing without reporting looks the same as one thinking. An idle-screen detector in the adapter would catch it sooner than the time limit.
 - **Should a failed stage keep its session?** It is removed today and only the scrollback is kept. Keeping it would allow a person to attach and continue.
-- **What is the version?** It is a string compared for equality. Pinning needs it to be a content hash.
+- **What is the version?** Answered: the git commit the process runs, which is a content hash of the tree, plus `-dirty` for uncommitted changes. Still compared for equality; pinning a fleet to something other than the server's own commit is the directory repository's job.
 - **Where do host capacities live?** In each host's config today. A directory repository would make them reviewable, at the cost of a second place to edit.
