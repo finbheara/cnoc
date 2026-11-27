@@ -3,7 +3,8 @@
  * steps and watched until it reports a result, exits, is cancelled or runs out of time.
  */
 import { type Adapter, type Step, expand, shellQuote } from "../jobfile";
-import type { AttemptEnd, JobSpec, StageResult } from "../protocol";
+import type { AttemptEnd, JobSpec, StageResult, Usage } from "../protocol";
+import { SESSION_VARS, betterUsage } from "../usage";
 import type { Tmux } from "./tmux";
 
 /** Persisted so a restarted client can pick the attempt up again. */
@@ -18,6 +19,8 @@ export interface AttemptState {
   results: StageResult[];
   /** A result the harness reported for the current stage, not yet acted on. */
   reported: StageResult | null;
+  /** The latest usage snapshot (`cnoc usage`) for the current stage. Absent in state saved by older clients. */
+  usage?: Usage | null;
 }
 
 export interface RunnerDeps {
@@ -33,7 +36,8 @@ export interface RunnerDeps {
 }
 
 export const REPORT =
-  'When the task is finished, run `cnoc done "<one-line summary>"`. If it cannot be completed, run `cnoc fail "<reason>"`. ' +
+  "When you finish, report once: if the task above names a closing command (cnoc done, fail or handoff), run that. " +
+  'Otherwise run `cnoc done "<one-line summary>"`, or `cnoc fail "<reason>"` if it cannot be completed. ' +
   'Use `cnoc progress "<note>"` for milestones.';
 
 export const sessionName = (attempt: number, stage: number): string => `cnoc-${attempt}-${stage}`;
@@ -65,6 +69,20 @@ export class AttemptRunner {
     return true;
   }
 
+  /** Called by the local API on `cnoc usage`. The latest snapshot for the stage is kept. */
+  snapshot(usage: Usage): void {
+    this.state.usage = usage;
+    this.deps.save();
+  }
+
+  /** Ends the attempt after a stage that did not report, keeping its last usage snapshot as its result. */
+  private endUnreported(outcome: "failed" | "cancelled", reason: string): AttemptEnd {
+    const usage = this.state.usage;
+    if (usage) this.state.results.push({ status: "failed", summary: reason, usage, reported: false });
+    this.state.usage = null;
+    return this.end(outcome, reason);
+  }
+
   private end(outcome: AttemptEnd["outcome"], reason: string | null): AttemptEnd {
     return { attempt: this.state.attempt, outcome, reason, results: this.state.results };
   }
@@ -77,28 +95,32 @@ export class AttemptRunner {
       this.resuming = false;
       if (resumed && st.phase === "launching") {
         await deps.tmux.kill(session);
-        return this.end("failed", "client-restarted-during-launch");
+        return this.endUnreported("failed", "client-restarted-during-launch");
       }
       if (!resumed) {
         st.phase = "launching";
         st.reported = null;
+        st.usage = null;
         deps.save();
         try {
           await this.launch(session);
         } catch (e) {
           await this.close(session, false);
-          if (this.cancelReason) return this.end("cancelled", this.cancelReason);
-          return this.end("failed", `launch: ${(e as Error).message}`);
+          if (this.cancelReason) return this.endUnreported("cancelled", this.cancelReason);
+          return this.endUnreported("failed", `launch: ${(e as Error).message}`);
         }
         st.phase = "prompted";
         deps.save();
       }
       const verdict = await this.watch(session);
       await this.close(session, true);
-      if (verdict.kind === "end") return this.end(verdict.outcome, verdict.reason);
+      if (verdict.kind === "end") return this.endUnreported(verdict.outcome, verdict.reason);
       const result = st.reported as StageResult;
+      const usage = betterUsage(result.usage, st.usage);
+      if (usage) result.usage = usage;
       st.results.push(result);
       st.reported = null;
+      st.usage = null;
       if (result.status === "failed") return this.end("failed", `stage ${st.stage + 1} failed: ${result.summary}`);
     }
     return this.end("done", null);
@@ -133,6 +155,10 @@ export class AttemptRunner {
       if (step.op === "tmux") {
         const cmd = expand(step.cmd, this.vars(), (name, v) => (QUOTED.has(name) ? shellQuote(v) : v));
         const env = {
+          // The session must not inherit a harness session id, from the client or from the global
+          // environment of the tmux server (kept from whichever process started it), or its reports
+          // would carry that session's usage. Empty, because tmux cannot unset; a job's ENV may set one.
+          ...Object.fromEntries(SESSION_VARS.map((v) => [v, ""])),
           ...st.spec.env,
           ...deps.baseEnv,
           CNOC_TOKEN: st.token,

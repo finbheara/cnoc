@@ -5,8 +5,10 @@ import { join, resolve } from "node:path";
 import { CnocClient, loadClientConfig } from "./client/client";
 import { JobfileError, checkTemplate, isTemplate, parseJob } from "./jobfile";
 import { type ChangeEvent, type Overrides, PROTOCOL, VERSION } from "./protocol";
+import { ReportError, parseHandoff, report, snapshot } from "./report";
 import { CnocServer, type HostInfo, type JobInfo, type ServerOptions } from "./server/server";
 import type { AttemptRow, TemplateRow } from "./server/store";
+import { formatUsage } from "./usage";
 
 const HELP = `cnoc ${VERSION} - batch scheduling of agent harness sessions across persistent hosts
 
@@ -48,6 +50,9 @@ Inside a job (the harness calls these)
   cnoc progress "note"
   cnoc done "summary"
   cnoc fail "reason"
+  cnoc handoff MERGED [-m "note"]          done, recording how the work was left
+  cnoc handoff BLOCKED -m "reason"         failed, recording how the work was left
+  cnoc usage                               record token usage so far without ending; for a Stop hook
 
 Connection: CNOC_URL and CNOC_TOKEN, or ~/.config/cnoc/cli.json { "url", "token" }.
 Inside a job the client's local socket is used and no credential is needed.`;
@@ -192,12 +197,6 @@ function printEvent(e: ChangeEvent): void {
   console.log(
     `${String(e.seq).padStart(6)}  ${new Date(e.ts).toISOString().slice(11, 19)}  ${e.type.padEnd(22)} ${who}${data}`,
   );
-}
-
-async function report(status: "done" | "failed", summary: string): Promise<void> {
-  if (!process.env.CNOC_SOCK) throw new CliError("not inside a Cnoc job (CNOC_SOCK is not set)");
-  const r = await api<{ accepted: boolean }>("POST", "/attempt/result", { status, summary });
-  console.log(r.accepted ? `reported ${status}` : "a result was already reported for this stage");
 }
 
 async function main(): Promise<void> {
@@ -423,7 +422,11 @@ async function main(): Promise<void> {
         console.log(
           `  attempt ${a.id} on ${a.host}: ${a.state}${a.outcome ? ` ${a.outcome}` : ""}${a.reason ? ` (${a.reason})` : ""}`,
         );
-      for (const [i, s] of (j.result ?? []).entries()) console.log(`  stage ${i + 1}: ${s.status}  ${s.summary}`);
+      for (const [i, s] of (j.result ?? []).entries()) {
+        const how = s.reported === false ? "no report" : `${s.status}${s.handoff ? `  handoff ${s.handoff}` : ""}`;
+        console.log(`  stage ${i + 1}: ${how}  ${s.summary}`);
+        if (s.usage) console.log(`    tokens: ${formatUsage(s.usage)}`);
+      }
       return;
     }
 
@@ -489,10 +492,19 @@ async function main(): Promise<void> {
       await api<unknown>("POST", "/attempt/progress", { note: pos.join(" ") });
       return;
     }
+    // Each exits once its report is answered: a transcript read given up at its time limit may leave a file open.
     case "done":
-      return report("done", pos.join(" "));
+      await report({ status: "done", summary: pos.join(" ") });
+      return process.exit(0);
     case "fail":
-      return report("failed", pos.join(" "));
+      await report({ status: "failed", summary: pos.join(" ") });
+      return process.exit(0);
+    case "handoff":
+      await report(parseHandoff(rest));
+      return process.exit(0);
+    case "usage":
+      await snapshot(rest.includes("--print"));
+      return process.exit(0);
 
     default:
       throw new CliError(`unknown command: ${cmd}\n\n${HELP}`);
@@ -500,7 +512,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  if (e instanceof CliError) console.error(`cnoc: ${e.message}`);
+  if (e instanceof CliError || e instanceof ReportError) console.error(`cnoc: ${e.message}`);
   else console.error(e);
   process.exit(1);
 });

@@ -161,9 +161,29 @@ Every session gets a `cnoc` command on its `PATH`:
 cnoc progress "tests are green"
 cnoc done "opened PR #88"
 cnoc fail "the schema migration needs a decision"
+cnoc handoff MERGED -m "PR #88 merged"            # done, and says how the work was left
+cnoc handoff BLOCKED -m "review asked for a redesign"   # failed; the message is required
 ```
 
-The built-in adapters append these instructions to the prompt. A project can also call them from a stop hook. A session that ends without reporting is `failed` with reason `no-result`.
+The built-in adapters append these instructions to the prompt, worded so that a prompt naming its own closing command (`… then run cnoc handoff MERGED`) is followed instead. A session that ends without reporting is `failed` with reason `no-result`.
+
+`handoff` takes `MERGED` or `BLOCKED` in any case. The status is stored as its own `handoff` field on the stage's result and in the `attempt.ended` and `job.terminal` events, so a subscriber can tell an agent that handed the work back blocked from a session that crashed without reading the text. It is unrelated to the `blocked` job state, which means waiting on a dependency.
+
+### Token usage
+
+When `done`, `fail` or `handoff` runs inside a Claude Code session, it reads that session's transcript (found by `CLAUDE_CODE_SESSION_ID` under `$CLAUDE_CONFIG_DIR` or `~/.claude`, subagents included) and sends the token counts with the result: input, output, cache writes and cache reads, in total and per model. No prices. `cnoc show ID` prints them, and the job API and the `attempt.ended` event carry them as `usage`. Reading is bounded to a few seconds; if the transcript cannot be found the result goes through without usage, and if it can only be read in part the usage says so in `partial`.
+
+An agent may stop, crash or run out of time without reporting. `cnoc usage` records the usage so far without ending the stage, and the latest one is kept on the stage's result if it ends with no report (shown as `no report` by `cnoc show`). Run it from a `Stop` hook, usually in the project's `.claude/settings.json` on each host:
+
+```json
+{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "command -v cnoc >/dev/null && cnoc usage; true" }] }]
+  }
+}
+```
+
+`cnoc usage` reads the hook's input from stdin, prints nothing and always exits 0, so it is harmless in sessions that are not Cnoc jobs. The guard keeps the hook quiet where `cnoc` is not on `PATH`, which matters if you put it in `~/.claude/settings.json`, where it runs in every session. `cnoc usage --print` shows what it would record.
 
 ## Harness adapters
 
