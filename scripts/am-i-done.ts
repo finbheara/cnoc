@@ -23,9 +23,9 @@
  * Jobfiles run in-process, with no second bun startup.
  *
  * The ladder: pre-commit is static only; pre-push adds the tests; `--ci` is
- * the same list with nothing auto-fixed. Hooks are bypassable (--no-verify),
- * and this repo has no CI workflow yet; until it does, `--ci` is run by hand
- * before a merge.
+ * the same list with nothing auto-fixed. Hooks are bypassable (--no-verify);
+ * the CI workflow (.github/workflows/ci.yml) runs `--ci` on every pull request
+ * and its jobs are required checks on main.
  */
 
 import { readFileSync } from "node:fs";
@@ -258,7 +258,7 @@ Usage:
 Flags:
   --pre-commit   the static checks: typecheck, lint, rules, example Jobfiles, shell scripts
   --pre-push     the static checks, then the whole test suite
-  --ci           the same list as --pre-push; nothing is auto-fixed
+  --ci           the same list as --pre-push; what the CI workflow runs
   --from N       resume from step N (number or name substring)
   --only N       run exactly one step (number or name substring)
   --skip NAME    skip a step by name (repeatable; substring match)

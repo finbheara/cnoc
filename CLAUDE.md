@@ -12,7 +12,8 @@ the design and its reasons, `docs/PLAN.md` for what is and is not built.
   Jobfiles, shellcheck, the whole test suite.
 - `bun am-i-done --pre-commit` / `--pre-push`: what the git hooks run (`.git-hooks/`, installed by
   `bun install`). Never bypass them with `--no-verify`.
-- `bun am-i-done --ci`: the same list as `--pre-push`. Run it before asking for a merge.
+- `bun am-i-done --ci`: the same list as `--pre-push`. CI runs it on Linux and macOS for every
+  pull request (`.github/workflows/ci.yml`), and both jobs must pass before a merge to `main`.
 - `--only NAME`, `--from NAME`, `--skip NAME` to iterate on one step.
 - `bun doing-it-wrong --list`: the rules. Each prints its own fix; read it instead of guessing.
   How to write or suppress one: `scripts/rules/README.md`.

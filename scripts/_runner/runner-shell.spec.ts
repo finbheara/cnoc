@@ -316,7 +316,7 @@ describe("StepRunner — wall-clock deadline", () => {
 
 describe("default run budget", () => {
   it("defaults to a 600s ceiling", () => {
-    // There is no CI workflow to pin this against yet, so only the default is asserted.
+    // The CI workflow sets no deadline of its own, so the default is the one value to pin.
     expect(DEFAULT_RUN_TIMEOUT_MS).toBe(600_000);
   });
 });

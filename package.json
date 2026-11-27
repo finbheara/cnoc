@@ -4,6 +4,7 @@
   "description": "Batch scheduling of agent harness sessions across persistent hosts",
   "license": "MIT",
   "type": "module",
+  "packageManager": "bun@1.4.5",
   "bin": { "cnoc": "src/cli.ts" },
   "scripts": {
     "am-i-done": "bun scripts/am-i-done.ts",

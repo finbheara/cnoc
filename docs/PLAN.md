@@ -19,7 +19,7 @@ Tested means covered by `bun test`: 78 tests of cnoc itself, 25 of them end to e
 | Git intake | `cnoc ingest` of a checkout's `jobs/` directory. |
 | Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. |
 | When and where | `begin` (a time or a delay), `--on HOST` through a `host/NAME` feature, priority at submit and on a waiting job. |
-| Gate | `bun am-i-done`: one ordered list of checks with a deadline, modes for the git hooks, and output kept out of an agent's context. `bun doing-it-wrong`: a rule engine with fifteen rules, each with fixtures. |
+| Gate | `bun am-i-done`: one ordered list of checks with a deadline, modes for the git hooks, and output kept out of an agent's context. `bun doing-it-wrong`: a rule engine with fifteen rules, each with fixtures. CI runs the gate on Linux and macOS, and both jobs are required on `main`. |
 | Client install | `install.sh`: clone, `cnoc` command, config, and a systemd user unit or launchd agent that leaves tmux sessions alone on restart. |
 
 Checked by hand, not by the test suite:
@@ -84,7 +84,6 @@ In rough order of value.
 
 Brought across without these parts of the gate it was taken from:
 
-- **A CI workflow.** Nothing runs the gate on a pull request. The hooks run it locally and can be bypassed.
 - **Coverage ratchet**, per-file spec accounting and per-file timing. `--ci` is the same list as `--pre-push` until they exist.
 - **Stale-todo check.** A `dotw-todo` must name an issue, but nothing fails when that issue is closed.
 - **Dead-module check.**
