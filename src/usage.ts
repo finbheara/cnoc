@@ -300,13 +300,19 @@ export function cleanUsage(x: unknown): Usage | undefined {
 }
 
 /**
- * Of two readings of one stage, the one to keep: a complete one over a partial one, then the one
- * that counted more responses. On a tie, the first.
+ * Of a report's own usage and the stage's last snapshot, the one to keep. A reading of another
+ * session never displaces the report's. A partial reading is a lower bound, so a complete one wins
+ * only if it counted at least as many responses; otherwise the one that counted more wins, and on
+ * a tie, the report's.
  */
-export function betterUsage(a: Usage | null | undefined, b: Usage | null | undefined): Usage | undefined {
-  if (!a || !b) return a ?? b ?? undefined;
-  if (Boolean(a.partial) !== Boolean(b.partial)) return a.partial ? b : a;
-  return b.responses > a.responses ? b : a;
+export function betterUsage(report: Usage | null | undefined, snap: Usage | null | undefined): Usage | undefined {
+  if (!report || !snap) return report ?? snap ?? undefined;
+  if (report.session !== snap.session) return report;
+  if (Boolean(report.partial) !== Boolean(snap.partial)) {
+    const [complete, partial] = report.partial ? [snap, report] : [report, snap];
+    return complete.responses >= partial.responses ? complete : partial;
+  }
+  return snap.responses > report.responses ? snap : report;
 }
 
 /** One line for `cnoc show`: `claude 1234 in, 56 out, 7 cache write, 89 cache read (model-a, model-b)`. */

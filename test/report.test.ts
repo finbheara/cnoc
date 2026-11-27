@@ -236,12 +236,26 @@ test("a report without usage takes the stage's latest snapshot", async () => {
   expect((await run).results).toEqual([{ status: "done", summary: "ok", usage: usage(5) }]);
 });
 
-test("a complete reading wins over a partial one, then the one with more responses", async () => {
+test("the stage keeps the reading that counted more, a complete one on a tie, and only its own session's", async () => {
   const partial = runner();
   await partial.ready;
   partial.r.snapshot(usage(5));
-  partial.r.report({ status: "done", summary: "ok", usage: { ...usage(0), responses: 9, partial: "unreadable" } });
+  partial.r.report({ status: "done", summary: "ok", usage: { ...usage(0), responses: 1, partial: "unreadable" } });
   expect((await partial.run).results[0]?.usage).toEqual(usage(5));
+
+  // A report that hit its time limit having counted 10 responses beats an earlier complete snapshot of 3.
+  const timedOut = { ...usage(8), responses: 10, partial: "read stopped at its time limit" };
+  const lowerBound = runner();
+  await lowerBound.ready;
+  lowerBound.r.snapshot({ ...usage(5), responses: 3 });
+  lowerBound.r.report({ status: "done", summary: "ok", usage: timedOut });
+  expect((await lowerBound.run).results[0]?.usage).toEqual(timedOut);
+
+  const otherSession = runner();
+  await otherSession.ready;
+  otherSession.r.snapshot({ ...usage(5), session: "another", responses: 50 });
+  otherSession.r.report({ status: "done", summary: "ok", usage: usage(2) });
+  expect((await otherSession.run).results[0]?.usage).toEqual(usage(2));
 
   const fewer = runner();
   await fewer.ready;

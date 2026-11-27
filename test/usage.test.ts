@@ -258,8 +258,19 @@ test("of two readings, a complete one wins, then the one with more responses", (
   }) as Usage;
   const b = { ...a, responses: 5 };
   expect(betterUsage(a, b)).toBe(b);
-  expect(betterUsage(a, { ...b, partial: "x" })).toBe(a);
   expect(betterUsage(a, { ...a })).toBe(a);
+  // A partial reading is a lower bound: it loses to a complete one only if that counted at least as much.
+  const partialMore = { ...b, partial: "x" };
+  expect(betterUsage(a, partialMore)).toBe(partialMore);
+  expect(betterUsage(partialMore, a)).toBe(partialMore);
+  const partialFewer = { ...a, responses: 2, partial: "x" };
+  expect(betterUsage(partialFewer, a)).toBe(a);
+  expect(betterUsage(a, partialFewer)).toBe(a);
+  const partialSame = { ...a, partial: "x" };
+  expect(betterUsage(partialSame, a)).toBe(a);
+  // Another session's snapshot never displaces the report's own reading.
+  const other = { ...b, session: "other" };
+  expect(betterUsage(a, other)).toBe(a);
   expect(betterUsage(undefined, a)).toBe(a);
   expect(betterUsage(null, undefined)).toBeUndefined();
 });
