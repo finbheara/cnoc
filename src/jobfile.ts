@@ -319,25 +319,49 @@ export function fill(text: string, set: Record<string, string>): Filled {
   const filled = lines.map((l) =>
     l.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => values.get(name) ?? whole),
   );
-  let key: string | null = null;
-  if (at >= 0) {
-    key = keyValue((filled[at] as string).replace(/^key\s*:/, "").trim(), at + 1);
-    filled[at] = "";
-  }
-  return { text: filled.join("\n"), key };
+  if (at >= 0) filled[at] = "";
+  return { text: filled.join("\n"), key: declaredKey(text, set) };
 }
+
+/** Matches a top-level front matter line `name: ...`, with the name optionally quoted. */
+const frontKey = (name: string) => new RegExp(`^(["']?)${name}\\1\\s*:`);
 
 /** The index of a top-level front matter line `name: ...`, or -1. */
 function frontLine(lines: string[], name: string): number {
   if (lines[0]?.trim() !== "---") return -1;
   const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
-  const re = new RegExp(`^${name}\\s*:`);
+  const re = frontKey(name);
   return lines.findIndex((l, i) => i > 0 && i < end && re.test(l));
 }
 
-/** A key as written: bare text taken literally (so `007` stays `007`), or a quoted YAML string. */
+/**
+ * The key a template declares, filled from `set` and the defaults. Only the `key:` line is
+ * filled, and only the arguments it uses must have a value, so the key of a run can be found
+ * even when the rest of the template no longer fills with these arguments. null when it has none.
+ */
+export function declaredKey(text: string, set: Record<string, string>): string | null {
+  const lines = text.split(/\r?\n/);
+  const at = frontLine(lines, "key");
+  if (at < 0) return null;
+  const args = new Map(argLines(text).map((a) => [a.name, a]));
+  const raw = (lines[at] as string).replace(frontKey("key"), "").trim();
+  const filled = raw.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => {
+    const a = args.get(name);
+    if (!a) return whole;
+    const v = set[name] ?? a.default;
+    if (v === null || v === undefined) throw new JobfileError(`argument ${name} has no default and was not set`);
+    if (/[\r\n]/.test(v)) throw new JobfileError(`argument ${name} must be a single line`);
+    return v;
+  });
+  return keyValue(filled, at + 1);
+}
+
+/**
+ * A key as written: bare text taken literally (so `007` stays `007`) up to a ` #` comment, or a
+ * quoted YAML string.
+ */
 function keyValue(raw: string, line: number): string {
-  let v = raw;
+  let v = raw.replace(/\s+#.*$/, "");
   if (/^["']/.test(raw)) {
     try {
       v = YAML.parse(raw) as string;
@@ -359,6 +383,11 @@ export function keyedId(name: string, key: string): string {
     throw new JobfileError(
       `key ${JSON.stringify(key)} is not a valid id segment: it must match ${KEY_RE.source} and make an id of at most 200 characters`,
     );
+  // Numbered runs are exactly the all-digit ids, so a key never names one.
+  if (/^\d+$/.test(key))
+    throw new JobfileError(`key ${JSON.stringify(key)} is all digits, which are the numbers of unkeyed runs`);
+  if (key.split("/").some((p) => p === "." || p === ".."))
+    throw new JobfileError(`key ${JSON.stringify(key)} has a . or .. segment`);
   return id;
 }
 

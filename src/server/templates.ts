@@ -3,7 +3,7 @@
  * job named `<template>/<n>` from a counter, or `<template>/<key>` when the run has a key.
  */
 import type { Database } from "bun:sqlite";
-import { JobfileError, type TemplateArg, checkTemplate, fill, keyedId, withId } from "../jobfile";
+import { JobfileError, type TemplateArg, checkTemplate, declaredKey, fill, keyedId, withId } from "../jobfile";
 import type { JobState, Overrides } from "../protocol";
 import { SubmitError } from "./errors";
 
@@ -27,7 +27,7 @@ export interface TemplateHost {
   readonly db: Database;
   emit(type: string, f?: { job?: string; actor?: string; data?: unknown }): number;
   meta(k: string, set?: string): string | null;
-  job(id: string): { state: JobState } | null;
+  job(id: string): { state: JobState; spec: { labels: Record<string, string> } } | null;
   submit(bodies: string[], actor: string, over?: Overrides, labels?: Record<string, string>): unknown;
 }
 
@@ -137,23 +137,27 @@ export function runTemplate(
   return s.db.transaction(() => {
     const t = findTemplate(s, ref);
     if (!t) throw new SubmitError(`no such template: ${ref}`, 404);
-    const existing = (job: string) => (s.job(job) ? { template: t, job, created: false } : null);
-    // A key given with the call names the job before anything is filled in, so a repeat is a
-    // no-op even when the template or the arguments have changed so far that they no longer fill.
+    // A keyed run that exists is this run offered again. A job by that id that this template did
+    // not start is something else, and is refused rather than passed off as the run.
+    const existing = (job: string) => {
+      const have = s.job(job);
+      if (!have) return null;
+      if (have.spec.labels.template !== t.name)
+        throw new SubmitError(`job ${job} exists and was not started by template ${t.name}`, 409);
+      return { template: t, job, created: false };
+    };
+    // The key is found and looked up before the template is filled, so a repeat is a no-op
+    // even when the template or the arguments have changed so far that they no longer fill.
     const given = opts.key;
-    let job = given === undefined ? null : refuse(() => keyedId(t.name, given));
+    const declared = given === undefined ? refuse(() => declaredKey(t.body, set)) : null;
+    const key = given ?? declared;
+    let job = key === null ? null : refuse(() => keyedId(t.name, key));
     const before = job === null ? null : existing(job);
     if (before) return before;
+    if (job === null && opts.keyed)
+      throw new SubmitError(`this run has no key: pass a key, or declare \`key:\` in template ${t.name}`);
     const filled = refuse(() => fill(t.body, set));
-    const declared = filled.key;
-    if (job === null && declared !== null) {
-      job = refuse(() => keyedId(t.name, declared));
-      const seen = existing(job);
-      if (seen) return seen;
-    }
     if (job === null) {
-      if (opts.keyed)
-        throw new SubmitError(`this run has no key: pass a key, or declare \`key:\` in template ${t.name}`);
       // The counter is kept by name and outlives the template, so a removed and re-added
       // template never reuses a job id. It skips ids that exist, keyed runs included.
       const counter = `template-runs:${t.name}`;
@@ -169,7 +173,6 @@ export function runTemplate(
       id,
       t.id,
     ]);
-    const key = given ?? declared;
     s.emit("template.run", { job: id, actor, data: { template: t.id, name: t.name, set, ...(key ? { key } : {}) } });
     return { template: findTemplate(s, String(t.id)) as TemplateRow, job: id, created: true };
   })();

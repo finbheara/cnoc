@@ -551,17 +551,18 @@ export class CnocServer {
           const b = (await req.json().catch(() => ({}))) as {
             set?: Record<string, string>;
             overrides?: Overrides;
-            key?: string;
-            keyed?: boolean;
+            key?: string | null;
+            keyed?: boolean | null;
           };
           const set = b.set ?? {};
           if (typeof set !== "object" || Object.values(set).some((v) => typeof v !== "string"))
             throw new SubmitError("expected { set: { NAME: value } }");
-          if (b.key !== undefined && typeof b.key !== "string") throw new SubmitError("key must be a string");
-          if (b.keyed !== undefined && typeof b.keyed !== "boolean") throw new SubmitError("keyed must be a boolean");
+          const key = b.key ?? undefined; // null is the same as absent
+          if (key !== undefined && typeof key !== "string") throw new SubmitError("key must be a string");
+          if (b.keyed != null && typeof b.keyed !== "boolean") throw new SubmitError("keyed must be a boolean");
           const r = this.store.templateRun(q.get("ref") ?? "", set, b.overrides ?? {}, who.actor, {
-            key: b.key,
-            keyed: b.keyed,
+            key,
+            keyed: b.keyed ?? undefined,
           });
           const job = this.jobView(r.job);
           const template = { ...r.template, body: undefined };

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   JobfileError,
   checkTemplate,
+  declaredKey,
   expand,
   fill,
   instantiate,
@@ -216,6 +217,22 @@ describe("template keys", () => {
     expect(keyedId("lane", "#12")).toBe("lane/#12");
     for (const bad of ["", "a b", "a//b", "/a", "a/", "x".repeat(200)])
       expect(() => keyedId("lane", bad)).toThrow(/is not a valid id segment/);
+    // All-digit ids are the numbered runs, so a key cannot be one.
+    for (const bad of ["1", "0042"]) expect(() => keyedId("lane", bad)).toThrow(/all digits/);
+    for (const ok of ["4/x", "007x", "issue-4", "myapp/4"]) expect(keyedId("lane", ok)).toBe(`lane/${ok}`);
+    for (const bad of [".", "..", "a/./b", "a/.."]) expect(() => keyedId("lane", bad)).toThrow(/\. or \.\. segment/);
+    expect(keyedId("lane", "a.b/.c")).toBe("lane/a.b/.c");
+  });
+
+  test("the declared key fills only its own line, and a trailing comment is dropped", () => {
+    const k = (line: string) => KEYED.replace("key: ${PROJECT}-${HOURS}", line);
+    expect(declaredKey(k("key: ${PROJECT}-${HOURS} # one per project"), { PROJECT: "p" })).toBe("p-12");
+    expect(declaredKey(k("key: issue#4"), {})).toBe("issue#4");
+    expect(declaredKey(k('key: "a #b" # c'), {})).toBe("a #b");
+    // Names the key does not use, known or not, do not matter; ones it uses must have a value.
+    expect(declaredKey(k("key: ${HOURS}h"), { NOPE: "1" })).toBe("12h");
+    expect(() => declaredKey(k("key: ${PROJECT}"), {})).toThrow(/PROJECT has no default/);
+    expect(declaredKey(TEMPLATE, {})).toBeNull();
   });
 
   test("a bad key is caught when the template is checked", () => {
@@ -231,6 +248,11 @@ describe("template keys", () => {
     expect(checkTemplate(plain)).toEqual({ name: "a", args: [] });
     expect(isTemplate("---\nid: a\nlabels: { key: b }\n---\nFROM app\n")).toBe(false);
     expect(isTemplate(TEMPLATE)).toBe(true);
+    // A quoted key is a key too, so checking it as a template finds it.
+    const quoted = plain.replace("key: b", '"key": b');
+    expect(isTemplate(quoted)).toBe(true);
+    expect(checkTemplate(quoted)).toEqual({ name: "a", args: [] });
+    expect(fill(quoted, {}).key).toBe("b");
   });
 });
 

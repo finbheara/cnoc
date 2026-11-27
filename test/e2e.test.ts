@@ -573,13 +573,19 @@ test("a keyed template run happens once, however often it is offered", async () 
   expect(first).toMatchObject({ status: 200, created: true, job: { id: `${name}/issue-7` } });
   expect(first.state).toBe(first.job.state);
   await reaches(`${name}/issue-7`, "failed");
-  for (const set of [{ ISSUE: "7", CMD: "false" }, { ISSUE: "7" }])
-    expect(await runOf({ set, keyed: true })).toMatchObject({
-      status: 200,
-      created: false,
-      state: "failed",
-      job: { id: `${name}/issue-7`, state: "failed" },
-    });
+  const again = {
+    status: 200,
+    created: false,
+    state: "failed",
+    job: { id: `${name}/issue-7`, state: "failed" },
+  };
+  // Other arguments, and then a template that now needs an argument this caller does not send.
+  expect(await runOf({ set: { ISSUE: "7", CMD: "echo other" }, keyed: true })).toMatchObject(again);
+  const changed = text.replace("ARG CMD=true\n", "ARG CMD=true\nARG NEW\n");
+  expect((await api("POST", "/v1/templates", { text: changed })).result).toBe("updated");
+  expect(await runOf({ set: { ISSUE: "7", CMD: "false" }, keyed: true, key: null })).toMatchObject(again);
+  expect((await runOf({ set: { ISSUE: "70" } })).error).toMatch(/NEW has no default/);
+  expect((await api("POST", "/v1/templates", { text })).result).toBe("updated");
 
   // A key given with the run overrides the template's, and may contain a slash.
   const own = await runOf({ set: { ISSUE: "8" }, key: "myapp/8" });
@@ -588,6 +594,15 @@ test("a keyed template run happens once, however often it is offered", async () 
   expect(await runOf({ set: { ISSUE: "9" }, key: "myapp/8" })).toMatchObject({ created: false, state: "done" });
   expect((await runOf({ set: { ISSUE: "1" }, key: "a b" })).error).toMatch(/not a valid id segment/);
   expect((await runOf({ set: { ISSUE: "1" }, key: 5 })).error).toMatch(/key must be a string/);
+  expect((await runOf({ set: { ISSUE: "1" }, key: "8" })).error).toMatch(/all digits/);
+  // A job this template did not start is not passed off as a run of it.
+  await submit(job(`${name}/plain`, "true"));
+  const taken = await runOf({ set: { ISSUE: "1" }, key: "plain" });
+  expect(taken).toMatchObject({
+    status: 409,
+    error: `job ${name}/plain exists and was not started by template ${name}`,
+  });
+  await reaches(`${name}/plain`, "done");
 
   const runs = (await events()).flatMap((e) =>
     e.type === "template.run" && (e.data as { name: string }).name === name ? [e.job] : [],

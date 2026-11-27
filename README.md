@@ -127,6 +127,7 @@ cnoc template rm disk-cleanup.job                                # by number, na
 - Each run is an ordinary job named `<template id>/<n>`. It keeps the content it was started with, whatever happens to the template later.
 - An `ARG` without a default must be given with `--set`. Only declared names are filled in, so `$USER` and `${HOME}` in a prompt reach the shell untouched.
 - Adding a template whose id already exists replaces its content and keeps its number.
+- `cnoc t` is short for `cnoc template`. [examples/disk-cleanup.job](examples/disk-cleanup.job) is a complete one.
 
 ### Keyed runs
 
@@ -144,13 +145,13 @@ ARG ISSUE
 
 ```
 cnoc template run lane --set PROJECT=myapp --set ISSUE=1234   # submits lane/myapp/1234
-cnoc template run lane --set PROJECT=myapp --set ISSUE=1234   # exists  lane/myapp/1234  running
+cnoc template run lane --set PROJECT=myapp --set ISSUE=1234   # exists     lane/myapp/1234  running  (already run with this key)
 cnoc template run lane --key hotfix --set PROJECT=myapp --set ISSUE=1   # submits lane/hotfix
 ```
 
 - A second run with the same key does nothing and says so, whatever state the job is in and whatever has changed in the arguments or the template since. A failed run is started again with `cnoc requeue`, not by running the template again.
-- A run without a key is numbered as before. The number skips ids that keyed runs have taken.
-- `cnoc t` is short for `cnoc template`. [examples/disk-cleanup.job](examples/disk-cleanup.job) is a complete one.
+- A key may not be all digits, since those are the numbers of unkeyed runs; `issue-4` and `myapp/4` are fine. A job by that id that the template did not start is refused, not taken for the run.
+- A run without a key is numbered as before.
 
 ## Reporting a result
 

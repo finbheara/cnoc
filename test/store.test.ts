@@ -205,10 +205,8 @@ test("a keyed run is named by its key, and running it again changes nothing", ()
   s.templateAdd(T("lane"), null, "t");
   const first = s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "myapp/1234" });
   expect(first).toMatchObject({ job: "lane/myapp/1234", created: true, template: { runs: 1 } });
-  const seq = s.seq();
   // Different arguments, a changed template, a failed job: all the same run.
   s.templateAdd(T("lane", "PROMPT false"), null, "t");
-  const updated = s.seq();
   expect(s.templateRun("lane", { PROJECT: "other" }, {}, "t", { key: "myapp/1234" })).toMatchObject({
     job: "lane/myapp/1234",
     created: false,
@@ -218,15 +216,35 @@ test("a keyed run is named by its key, and running it again changes nothing", ()
   expect(s.templateRun("lane", {}, {}, "t", { key: "myapp/1234", keyed: true }).created).toBe(false);
   expect(s.job("lane/myapp/1234")?.state).toBe("failed");
   expect(s.seq()).toBe(failed);
-  expect(updated).toBe(seq + 1);
   expect(s.template("lane")?.runs).toBe(1);
-  expect(
-    s
-      .events(0)
-      .filter((e) => e.type === "template.run")
-      .map((e) => e.data),
-  ).toEqual([{ template: 1, name: "lane", set: { PROJECT: "app" }, key: "myapp/1234" }]);
+  expect(s.events(0).flatMap((e) => (e.type === "template.run" ? [e.data] : []))).toEqual([
+    { template: 1, name: "lane", set: { PROJECT: "app" }, key: "myapp/1234" },
+  ]);
   expect(() => s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "a b" })).toThrow(/not a valid id segment/);
+});
+
+test("a declared key finds its run even after the template's arguments change", () => {
+  const keyed = (extra = "") =>
+    T("lane")
+      .replace("id: lane\n", "id: lane\nkey: ${PROJECT}-${NOTE} # one per project\n")
+      .replace("ARG NOTE=hi\n", extra);
+  s.templateAdd(keyed("ARG NOTE=hi\n"), null, "t");
+  expect(s.templateRun("lane", { PROJECT: "app" }, {}, "t").job).toBe("lane/app-hi");
+  run("lane/app-hi", "failed");
+  const failed = s.seq();
+  // The template gains a required argument the feeder does not send yet.
+  s.templateAdd(keyed("ARG NOTE=hi\nARG NEW\n"), null, "t");
+  expect(s.templateRun("lane", { PROJECT: "app" }, {}, "t", { keyed: true })).toMatchObject({
+    job: "lane/app-hi",
+    created: false,
+  });
+  // It drops one the feeder still sends, and its default moves into the key line.
+  s.templateAdd(keyed().replace("${NOTE}", "hi"), null, "t");
+  expect(s.templateRun("lane", { PROJECT: "app", NOTE: "hi" }, {}, "t").created).toBe(false);
+  expect(s.seq()).toBe(failed + 2); // the two template.updated events, nothing else
+  expect(s.job("lane/app-hi")?.state).toBe("failed");
+  // A new key still fills the whole template, so its errors still show.
+  expect(() => s.templateRun("lane", { PROJECT: "other", NOTE: "hi" }, {}, "t")).toThrow(/unknown argument NOTE/);
 });
 
 test("a template can declare its key, and a key given with the run overrides it", () => {
@@ -237,17 +255,37 @@ test("a template can declare its key, and a key given with the run overrides it"
   expect(s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "mine" }).job).toBe("lane/mine");
   expect(s.job("lane/app-hi")?.spec.labels).toEqual({ template: "lane" });
   expect(() => s.templateRun("lane", { PROJECT: "a b" }, {}, "t")).toThrow(/key "a b-hi" is not a valid id segment/);
+  expect(() => s.templateRun("lane", {}, {}, "t")).toThrow(/PROJECT has no default/);
 });
 
-test("keyed refuses a run with no key; unkeyed runs skip ids that keyed runs took", () => {
+test("keyed refuses a run with no key; a key is never a run number", () => {
   s.templateAdd(T("lane"), null, "t");
-  expect(() => s.templateRun("lane", { PROJECT: "app" }, {}, "t", { keyed: true })).toThrow(SubmitError);
-  expect(() => s.templateRun("lane", { PROJECT: "app" }, {}, "t", { keyed: true })).toThrow(/this run has no key/);
+  expect(() => s.templateRun("lane", {}, {}, "t", { keyed: true })).toThrow(SubmitError);
+  expect(() => s.templateRun("lane", {}, {}, "t", { keyed: true })).toThrow(/this run has no key/);
   expect(s.jobs()).toEqual([]);
-  s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "1" });
-  s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "3" });
-  const numbered = [1, 2, 3].map(() => s.templateRun("lane", { PROJECT: "app" }, {}, "t").job);
-  expect(numbered).toEqual(["lane/2", "lane/4", "lane/5"]);
-  // A keyed run whose key a numbered run already took is that run.
-  expect(s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "4" })).toMatchObject({ created: false });
+  expect(s.templateRun("lane", { PROJECT: "app" }, {}, "t").job).toBe("lane/1");
+  expect(() => s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "1" })).toThrow(/all digits/);
+  for (const key of ["4/x", "007x", "issue-4", "myapp/4"])
+    expect(s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key }).created).toBe(true);
+  // The counter skips an id that exists, whoever made it.
+  s.submit([J("lane/2")], "t");
+  expect(s.templateRun("lane", { PROJECT: "app" }, {}, "t").job).toBe("lane/3");
+});
+
+test("a keyed run does not adopt a job that this template did not start", () => {
+  s.templateAdd(T("lane"), null, "t");
+  s.submit([J("lane/plain")], "t");
+  expect(() => s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "plain" })).toThrow(
+    /job lane\/plain exists and was not started by template lane/,
+  );
+  s.templateAdd(T("lane/b"), null, "t");
+  expect(s.templateRun("lane/b", { PROJECT: "app" }, {}, "t").job).toBe("lane/b/1");
+  let thrown = false;
+  try {
+    s.templateRun("lane", { PROJECT: "app" }, {}, "t", { key: "b/1" });
+  } catch (e) {
+    thrown = true;
+    expect(e).toMatchObject({ status: 409, message: "job lane/b/1 exists and was not started by template lane" });
+  }
+  expect(thrown).toBe(true);
 });
