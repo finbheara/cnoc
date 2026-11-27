@@ -1,21 +1,22 @@
 import { expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { specTempDir } from "../scripts/testkit";
 import {
   DEFAULT_MAX,
+  EXIT_FATAL,
   type FeedDeps,
   type FeedOptions,
+  type FeedServer,
   type RunRequest,
-  type SubmitRun,
   feed,
   feedPass,
   parseFeedArgs,
   parseFeedLine,
 } from "../src/feed";
 
-/** Long enough for `sh` to start and print; the slow source below would take far longer. */
-const SHORT_SOURCE_TIMEOUT_MS = 500;
+/** Long enough for a fake server to answer; the one that never answers takes forever. */
+const SHORT_REQUEST_TIMEOUT_MS = 300;
 
 const dir = specTempDir("cnoc-feed-");
 let n = 0;
@@ -27,23 +28,35 @@ const source = (lines: string[], status = 0): string[] => {
 };
 const line = (o: object) => JSON.stringify(o);
 
-/** A server that knows each run by its key, and records what it was sent. */
-function fake() {
+const httpError = (status: number, message: string) => Object.assign(new Error(message), { status });
+
+/** A server that knows each run by its key, and records what it was sent. `over` replaces its calls. */
+function fake(over: Partial<FeedServer> = {}) {
   const seen = new Set<string>();
   const calls: Array<{ ref: string; body: RunRequest }> = [];
-  const submit: SubmitRun = async (ref, body) => {
-    calls.push({ ref, body });
-    if (ref === "missing") throw Object.assign(new Error(`no template ${ref}`), { status: 404 });
-    if (!body.key) throw Object.assign(new Error("lane declares no key and none was given"), { status: 400 });
+  let healthChecks = 0;
+  const run: FeedServer["run"] = async (ref, body) => {
+    if (ref === "missing") throw httpError(404, `no template ${ref}`);
+    if (!body.key) throw httpError(400, "lane declares no key and none was given");
     const id = `${ref}/${body.key}`;
     const created = !seen.has(id);
     seen.add(id);
-    return { job: { id, state: "queued" }, created, state: "queued" };
+    return { job: { id, state: "queued" }, template: {}, created, state: "queued", seq: 1 };
+  };
+  const server: FeedServer = {
+    health: async (signal) => {
+      healthChecks++;
+      return over.health ? over.health(signal) : { ok: true, features: ["keyed-runs"] };
+    },
+    run: async (ref, body, signal) => {
+      calls.push({ ref, body });
+      return (over.run ?? run)(ref, body, signal);
+    },
   };
   const out: string[] = [];
   const err: string[] = [];
-  const deps: FeedDeps = { submit, log: (l) => out.push(l), warn: (l) => err.push(l) };
-  return { calls, out, err, deps };
+  const deps: FeedDeps = { server, log: (l) => out.push(l), warn: (l) => err.push(l) };
+  return { calls, out, err, deps, healthChecks: () => healthChecks };
 }
 const opts = (command: string[], over: Partial<FeedOptions> = {}): FeedOptions => ({
   command,
@@ -95,7 +108,16 @@ test("a malformed line says what is wrong with it", () => {
   expect(bad(line({ key: "k" }))).toMatch(/"template" must be a name or a number/);
   expect(bad(line({ template: "lane", project: "x" }))).toBe('unknown field "project"');
   expect(bad(line({ template: "lane", key: 7 }))).toMatch(/"key" must be/);
-  expect(bad(line({ template: "lane", set: { A: { b: 1 } } }))).toBe('"set.A" must be a string or a number');
+  expect(bad(line({ template: "lane", set: { A: { b: 1 } } }))).toBe('"set.A" must be a string or a whole number');
+  expect(bad('{"template":"lane","set":{"ISSUE":12345678901234567890}}')).toBe(
+    '"set.ISSUE" is a number JSON cannot carry exactly; send it as a string',
+  );
+  expect(bad(line({ template: "lane", set: { ISSUE: 1e21 } }))).toMatch(/send it as a string/);
+  expect(bad(line({ template: "lane", set: { ISSUE: 1.5 } }))).toMatch(/send it as a string/);
+  expect(bad('{"template":"lane","set":{"__proto__":"x"}}')).toBe(
+    '"set" name "__proto__" is not an ARG name (capitals, digits, _)',
+  );
+  expect(bad(line({ template: "lane", set: { project: "x" } }))).toMatch(/not an ARG name/);
   expect(bad(line({ template: "lane", priority: 1.5 }))).toMatch(/"priority"/);
   expect(bad(line({ template: "lane", on: "" }))).toMatch(/"on"/);
   expect(bad(line({ template: "lane", begin: 3 }))).toMatch(/"begin"/);
@@ -194,40 +216,110 @@ test("the source's stderr is repeated in the log", async () => {
   expect(f.out).toEqual(["[feed] pass: 0 created, 0 already there, 0 rejected"]);
 });
 
-test("a source that runs too long is stopped with everything it started", async () => {
-  const f = fake();
-  const pidFile = join(dir, "child.pid");
-  // The grandchild holds stdout open, so only stopping the whole group ends the pass.
-  const cmd = ["sh", "-c", `echo '${line({ template: "lane", key: "a" })}'; sleep 600 & echo $! > "$0"; wait`, pidFile];
-  const r = await feedPass(opts(cmd), { ...f.deps, timeoutMs: SHORT_SOURCE_TIMEOUT_MS });
-  expect(r.failure).toBe(`command timed out after ${SHORT_SOURCE_TIMEOUT_MS / 1000}s`);
-  expect(f.calls).toEqual([]);
-  const child = Number(readFileSync(pidFile, "utf8"));
-  expect(() => process.kill(child, 0)).toThrow();
+test("a server without keyed runs gets no submission at all, and the feeder exits 78", async () => {
+  // An older server answers health without features and would make a numbered job of every run.
+  const old = fake({ health: async () => ({ ok: true, version: "0.1.0", protocol: 1 }) });
+  const backlog = source([line({ template: "lane", key: "a" })]);
+  expect(await feed(opts(backlog), old.deps)).toBe(EXIT_FATAL);
+  expect(await feed(parseFeedArgs(["--every", "1s", "--", ...backlog]), old.deps)).toBe(EXIT_FATAL);
+  expect(old.calls).toEqual([]);
+  expect(old.err.at(-1)).toMatch(/does not do keyed template runs.*not retrying \(exit 78\)$/);
+
+  // A server that says it does, but answers without `created`, stops the feeder after one run.
+  const liar = fake({ run: async (ref) => ({ job: { id: `${ref}/1`, state: "queued" } }) });
+  expect(
+    await feed(opts(source([line({ template: "lane", key: "a" }), line({ template: "lane", key: "b" })])), liar.deps),
+  ).toBe(EXIT_FATAL);
+  expect(liar.calls.length).toBe(1);
 });
 
-test("a lost server stops the pass; a server without keyed runs stops the feeder", async () => {
-  const f = fake();
-  const backlog = source([line({ template: "lane", key: "a" }), line({ template: "lane", key: "b" })]);
-  const down: SubmitRun = async () => {
-    throw new Error("cannot reach http://127.0.0.1:1: Connection refused");
-  };
-  const r = await feedPass(opts(backlog), { ...f.deps, submit: down });
-  expect(r).toMatchObject({ created: 0, rejected: 0, failure: "cannot reach http://127.0.0.1:1: Connection refused" });
-  expect(f.err).toEqual([
-    "[feed] pass stopped at line 1: cannot reach http://127.0.0.1:1: Connection refused",
-    "[feed] pass: 0 created, 0 already there, 0 rejected (stopped early)",
-  ]);
+test("a refused token stops the feeder with 78, in a loop too", async () => {
+  for (const status of [401, 403]) {
+    const f = fake({ run: async () => Promise.reject(httpError(status, "bad token")) });
+    const backlog = source([line({ template: "lane", key: "a" }), line({ template: "lane", key: "b" })]);
+    expect(await feed(parseFeedArgs(["--every", "1s", "--", ...backlog]), f.deps)).toBe(EXIT_FATAL);
+    expect(f.calls.length).toBe(1);
+    expect(f.err.at(-1)).toBe(`[feed] the server refused the token (${status}): bad token; not retrying (exit 78)`);
+  }
+});
 
-  let calls = 0;
-  const old: SubmitRun = async (ref) => {
-    calls++;
-    return { job: { id: `${ref}/${calls}`, state: "queued" } };
-  };
+test("health is asked once, before the first submission, and not for an empty backlog", async () => {
+  const f = fake();
+  await feed(opts(source([])), f.deps);
+  expect(f.healthChecks()).toBe(0);
   const stop = new AbortController();
-  expect(await feed(opts(backlog, { everyS: 0 }), { ...f.deps, submit: old, signal: stop.signal })).toBe(1);
-  expect(calls).toBe(1);
-  expect(f.err.at(-1)).toMatch(/does not support keyed runs/);
+  let passes = 0;
+  const log = (l: string) => {
+    if (l.startsWith("[feed] pass:") && ++passes === 3) stop.abort();
+  };
+  await feed(opts(source([line({ template: "lane", key: "a" })]), { everyS: 0 }), {
+    ...f.deps,
+    log,
+    signal: stop.signal,
+  });
+  expect(f.healthChecks()).toBe(1);
+});
+
+test("a lost server, a server error or a malformed answer stops the pass after what was created", async () => {
+  const backlog = source(["a", "b", "c"].map((key) => line({ template: "lane", key })));
+  const cases: Array<[FeedServer["run"], string]> = [
+    [
+      async () => Promise.reject(new Error("cannot reach http://127.0.0.1:1: Connection refused")),
+      "cannot reach http://127.0.0.1:1: Connection refused",
+    ],
+    [async () => Promise.reject(httpError(500, "database is locked")), "database is locked"],
+    [async () => null, "the server's answer has no job: null"],
+    [async () => ({ created: true }), 'the server\'s answer has no job: {"created":true}'],
+  ];
+  for (const [broken, why] of cases) {
+    let n = 0;
+    const f = fake();
+    const ok = f.deps.server.run;
+    const g = fake({
+      run: async (ref, body, signal) => (++n === 3 ? broken(ref, body, signal) : ok(ref, body, signal)),
+    });
+    const r = await feedPass(opts(backlog), g.deps);
+    expect(r).toEqual({ created: 2, existing: 0, rejected: 0, heldBack: 0, failure: why });
+    expect(g.err).toEqual([
+      `[feed] pass stopped at line 3: ${why}`,
+      "[feed] pass: 2 created, 0 already there, 0 rejected (stopped early)",
+    ]);
+    expect(await feed(opts(backlog), fake({ run: broken }).deps)).toBe(1);
+  }
+});
+
+test("a stop during submission sends nothing more, and a request that is never answered times out", async () => {
+  const stop = new AbortController();
+  const backlog = source(["a", "b", "c"].map((key) => line({ template: "lane", key })));
+  const f = fake();
+  const ok = f.deps.server.run;
+  const g = fake({
+    run: async (ref, body, signal) => {
+      if (body.key === "b") stop.abort();
+      return ok(ref, body, signal);
+    },
+  });
+  const r = await feedPass(opts(backlog), { ...g.deps, signal: stop.signal });
+  expect(g.calls.map((c) => c.body.key)).toEqual(["a", "b"]);
+  // The stop came while b was in flight, so its answer is not waited for; c is never sent.
+  expect(r).toMatchObject({ created: 1, failure: "stopped" });
+
+  // A server that takes the request and never answers: a stop ends the wait, and so does the timeout.
+  const hang: FeedServer["run"] = (_ref, _body, signal) =>
+    new Promise((_, fail) => signal.addEventListener("abort", () => fail(new Error("aborted"))));
+  const stop2 = new AbortController();
+  const h = fake({
+    run: (ref, body, signal) => {
+      stop2.abort();
+      return hang(ref, body, signal);
+    },
+  });
+  expect(await feedPass(opts(backlog), { ...h.deps, signal: stop2.signal })).toMatchObject({ failure: "stopped" });
+  expect(h.calls.length).toBe(1);
+  const t = fake({ run: hang });
+  expect(await feedPass(opts(backlog), { ...t.deps, requestTimeoutMs: SHORT_REQUEST_TIMEOUT_MS })).toMatchObject({
+    failure: `no answer from the server in ${SHORT_REQUEST_TIMEOUT_MS / 1000}s`,
+  });
 });
 
 test("a looping feeder logs a failed pass and carries on until it is stopped", async () => {

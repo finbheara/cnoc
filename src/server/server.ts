@@ -486,7 +486,8 @@ export class CnocServer {
     const q = url.searchParams;
     const J = (body: unknown, status = 200) => Response.json(body, { status });
     try {
-      if (path === "/v1/health") return J({ ok: true, version: this.version, protocol: PROTOCOL });
+      if (path === "/v1/health")
+        return J({ ok: true, version: this.version, protocol: PROTOCOL, features: ["keyed-runs"] });
       if (path === "/v1/client") {
         if (server.upgrade(req, { data: { nonce: randomBytes(16).toString("base64url"), host: null } }))
           return undefined;

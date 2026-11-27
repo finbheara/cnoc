@@ -3,7 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CnocClient, loadClientConfig } from "./client/client";
-import { type RunAnswer, feedCommand } from "./feed";
+import { feedCommand } from "./feed";
 import { JobfileError, checkTemplate, isTemplate, parseJob } from "./jobfile";
 import { type ChangeEvent, type Overrides, PROTOCOL } from "./protocol";
 import { ReportError, parseHandoff, report, snapshot } from "./report";
@@ -103,7 +103,13 @@ type OneJob = { job: JobInfo };
 /** A template as listed: everything but its text. */
 type TemplateInfo = Omit<TemplateRow, "body">;
 
-async function api<T>(method: string, path: string, body?: unknown, contentType = "application/json"): Promise<T> {
+async function api<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  contentType = "application/json",
+  signal?: AbortSignal,
+): Promise<T> {
   const sock = process.env.CNOC_SOCK;
   let base: string;
   let token: string | undefined;
@@ -122,6 +128,7 @@ async function api<T>(method: string, path: string, body?: unknown, contentType 
     headers: { authorization: `Bearer ${token}`, ...(body !== undefined ? { "content-type": contentType } : {}) },
     body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
     ...(unix ? { unix } : {}),
+    ...(signal ? { signal } : {}),
   } as RequestInit).catch((e: Error) => {
     throw new CliError(`cannot reach ${unix ?? base}: ${e.message}`);
   });
@@ -411,9 +418,11 @@ async function main(): Promise<void> {
 
     case "feed":
       return process.exit(
-        await feedCommand(rest, (ref, body) =>
-          api<RunAnswer>("POST", `/v1/template/run?ref=${encodeURIComponent(ref)}`, body),
-        ),
+        await feedCommand(rest, {
+          health: (signal) => api<unknown>("GET", "/v1/health", undefined, undefined, signal),
+          run: (ref, body, signal) =>
+            api<unknown>("POST", `/v1/template/run?ref=${encodeURIComponent(ref)}`, body, undefined, signal),
+        }),
       );
 
     case "queue": {

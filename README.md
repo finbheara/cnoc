@@ -293,7 +293,7 @@ Cnoc does not know what a backlog is. `cnoc feed` runs a command you give it, an
 A typical path from an issue to a job:
 
 1. Someone puts a label such as `ready-for-agent` on an issue.
-2. A source script lists the labelled issues. [examples/feed-github-issues.sh](examples/feed-github-issues.sh) does it with `gh issue list`.
+2. A source script lists the labelled issues, oldest first. [examples/feed-github-issues.sh](examples/feed-github-issues.sh) does it with `gh issue list`. It fails, rather than printing nothing, if the label does not exist, and fails rather than cutting the list short if more issues match than its limit.
 3. `cnoc feed` submits each line as a keyed run of the template: the job is named `<template>/<key>`, here `lane/myapp-1234`.
 4. The next pass offers the same issue again. Its key exists, so nothing happens. Only issues not seen before become jobs.
 
@@ -305,10 +305,22 @@ cnoc feed --dry-run -- examples/feed-github-issues.sh example-org/myapp ready-fo
 - `template` is required. `key` may be left out when the template declares its own key; a line with neither is rejected, so a pass can never create a fresh job each time. `set`, `priority`, `on` and `begin` are as for `cnoc template run`, and a field set to `null` counts as left out.
 - A key may not be all digits, because `<template>/<n>` is the name of an unkeyed, numbered run. That is why the example keys an issue as `myapp-1234`, not `1234`.
 - Without `--every` it makes one pass and exits, non-zero if the command failed or any line was rejected, which suits cron or a systemd timer. With `--every` it repeats, one pass at a time, and logs failures and carries on.
-- `--max N` (default 10) caps the new jobs a pass may create, so a source that suddenly lists a thousand items starts ten. The rest are created on later passes.
-- The command runs without a shell (use `sh -c '...'` if you need one) and has two minutes. If it fails or times out, nothing from that pass is submitted, even lines it printed. A bad line is reported with its line number and the other lines still go.
+- `--max N` (default 10) caps the new jobs a pass may create, so a source that suddenly lists a thousand items starts ten. Lines past the cap are not sent; while the source keeps listing them they are offered again on the next pass, and the first new ones in its order are created. A source that lists oldest first, as the example does, therefore works through the whole backlog; one that lists newest first can keep old items waiting while new ones arrive.
+- The command runs without a shell (use `sh -c '...'` if you need one), in its own process group. It has two minutes, 10,000 lines and 16 MiB of output. If it fails, times out or prints more, nothing from that pass is submitted, even lines it printed. On a timeout the process group gets SIGTERM, then SIGKILL; a descendant that started a session of its own is outside the group and is not stopped, but the feeder stops waiting for it. Anything still running in the group after the command exits is stopped too. A bad line is reported with its line number and the other lines still go.
+- The command does not get `CNOC_TOKEN` (or `CNOC_SOCK`); it has no access to the server. The feeder logs the command and its arguments when it starts, so do not pass secrets as arguments; give them to the command through its own environment or config.
 - It prints a line per job it creates and one summary per pass, and nothing for items that already exist.
+- Each request has 30 seconds. SIGTERM or SIGINT stops the command or the request in flight and ends the feeder after that pass; a second one exits at once.
+- Exit status 78 means carrying on cannot help: the server does not do keyed runs (it says so in `/v1/health`, which the feeder asks before submitting anything), or it refuses the token. Tell the service manager not to restart on it.
 - The feeder keeps no state. Removing the label stops an issue being offered but does not cancel its job. A job that failed stays failed: listing it again does nothing, and it runs again only when someone runs `cnoc requeue`.
+
+As a systemd user service:
+
+```
+[Service]
+ExecStart=%h/.local/bin/cnoc feed --every 5m -- %h/feeds/myapp-issues.sh
+Restart=on-failure
+RestartPreventExitStatus=78
+```
 
 ## Development
 

@@ -38,23 +38,22 @@ async function api(
 }
 const jobStatus = async (id: string) => (await api("GET", `/v1/job?id=${encodeURIComponent(id)}`)).status;
 
-/** Runs `cnoc feed` as its own process against the test server, never the one in the CLI config. */
-async function feedCli(...args: string[]) {
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    CNOC_URL: server.url,
-    CNOC_TOKEN: server.adminToken,
-  };
+/** Starts `cnoc feed` as its own process against the test server, never the one in the CLI config. */
+function startFeed(args: string[], to: { url: string; token: string } = { url: server.url, token: server.adminToken }) {
+  const env: Record<string, string | undefined> = { ...process.env, CNOC_URL: to.url, CNOC_TOKEN: to.token };
   env.CNOC_SOCK = undefined;
   const p = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "cli.ts"), "feed", ...args], {
     env,
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   const lines = (s: string) => s.split("\n").filter(Boolean);
-  return { out: lines(out), err: lines(err), code };
+  const done = Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]).then(
+    ([out, err, code]) => ({ out: lines(out), err: lines(err), code }),
+  );
+  return { proc: p, done };
 }
+const feedCli = (...args: string[]) => startFeed(args).done;
 
 /** Adds a template with PROJECT and ISSUE and returns its name. */
 async function template(front = ""): Promise<string> {
@@ -166,4 +165,83 @@ test("a feeder reports bad lines and refused runs, submits the rest, and submits
     code: 1,
   });
   expect(await jobStatus(`${name}/d`)).toBe(404);
+});
+
+/** A stand-in server. `run` answers the template run route; every request is counted. */
+function stub(health: object, run: (req: Request) => Promise<Response> | Response) {
+  const seen: string[] = [];
+  const srv = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch: (req) => {
+      const path = new URL(req.url).pathname;
+      seen.push(`${req.method} ${path}`);
+      return path === "/v1/health" ? Response.json(health) : run(req);
+    },
+  });
+  return { url: `http://127.0.0.1:${srv.port}`, seen, stop: () => srv.stop(true) };
+}
+
+test("against a server without keyed runs, starting the feeder again and again creates nothing", async () => {
+  // The server before keyed runs: the same health answer except for features, and a run route that
+  // would make a numbered job of every request.
+  let made = 0;
+  const old = stub({ ok: true, version: "0.1.0", protocol: 1 }, () =>
+    Response.json({ job: { id: `free/${++made}`, state: "queued" } }),
+  );
+  try {
+    const backlog = join(root, "old.jsonl");
+    writeFileSync(backlog, `${JSON.stringify({ template: "free", key: "a" })}\n`);
+    for (const args of [
+      ["--", "cat", backlog],
+      ["--every", "1s", "--", "cat", backlog],
+      ["--", "cat", backlog],
+    ]) {
+      const r = await startFeed(args, { url: old.url, token: "t" }).done;
+      expect(r.code).toBe(78);
+      expect(r.err.at(-1)).toMatch(/does not do keyed template runs.*\(exit 78\)$/);
+    }
+    expect(made).toBe(0);
+    expect(old.seen).toEqual(["GET /v1/health", "GET /v1/health", "GET /v1/health"]);
+  } finally {
+    old.stop();
+  }
+});
+
+test("a wrong token ends the feeder with 78, even with --every", async () => {
+  const name = await template("key: ${PROJECT}-${ISSUE}\n");
+  const backlog = join(root, `${name}.jsonl`);
+  writeFileSync(backlog, `${JSON.stringify({ template: name, set: { PROJECT: "myapp", ISSUE: "1" } })}\n`);
+  const r = await startFeed(["--every", "1s", "--", "cat", backlog], { url: server.url, token: "wrong" }).done;
+  expect(r.code).toBe(78);
+  expect(r.err.at(-1)).toMatch(/^\[feed\] the server refused the token \(401\).*not retrying \(exit 78\)$/);
+  expect(await jobStatus(`${name}/myapp-1`)).toBe(404);
+});
+
+test("SIGTERM during submission to a server that never answers ends the feeder promptly", async () => {
+  let arrived: () => void = () => {};
+  const inFlight = new Promise<void>((done) => {
+    arrived = done;
+  });
+  const silent = stub({ ok: true, features: ["keyed-runs"] }, () => {
+    arrived();
+    return new Promise<Response>(() => {});
+  });
+  try {
+    const backlog = join(root, "silent.jsonl");
+    writeFileSync(backlog, ["a", "b", "c"].map((key) => `${JSON.stringify({ template: "t", key })}\n`).join(""));
+    const feeder = startFeed(["--every", "1h", "--", "cat", backlog], { url: silent.url, token: "t" });
+    await inFlight;
+    feeder.proc.kill("SIGTERM");
+    const r = await feeder.done;
+    expect(r.code).toBe(0);
+    expect(r.err).toEqual([
+      "[feed] SIGTERM: stopping; send it again to exit at once",
+      "[feed] pass stopped at line 1: stopped",
+      "[feed] pass: 0 created, 0 already there, 0 rejected (stopped early)",
+    ]);
+    expect(silent.seen).toEqual(["GET /v1/health", "POST /v1/template/run"]);
+  } finally {
+    silent.stop();
+  }
 });
