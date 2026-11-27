@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import { JobfileError, parseBegin, parseJob } from "../jobfile";
 import type { AttemptEnd, ChangeEvent, JobSpec, JobState, Measured, Overrides, Resources } from "../protocol";
 import { TERMINAL } from "../protocol";
+import { reportedFields } from "../report";
 import { SubmitError } from "./errors";
 import {
   type RunOptions,
@@ -305,9 +306,10 @@ export class Store {
     reason: string | null,
     result: unknown,
     actor?: string,
+    extra: object = {},
   ): void {
     this.setJob(id, state, reason, { result, cancel: 0 });
-    this.emit("job.terminal", { job: id, actor, data: { state, reason } });
+    this.emit("job.terminal", { job: id, actor, data: { state, reason, ...extra } });
     this.wake(id);
   }
 
@@ -489,13 +491,14 @@ export class Store {
         "UPDATE attempts SET state = 'ended', outcome = ?, reason = ?, ended_at = ?, result = ? WHERE id = ?",
         [end.outcome, end.reason, Date.now(), json(end.results), a.id],
       );
+      const { handoff, usage } = reportedFields(end.results);
       this.emit("attempt.ended", {
         job: a.job,
         attempt: a.id,
         host,
-        data: { outcome: end.outcome, reason: end.reason },
+        data: { outcome: end.outcome, reason: end.reason, ...handoff, ...usage },
       });
-      this.finish(a.job, end.outcome, end.reason, end.results);
+      this.finish(a.job, end.outcome, end.reason, end.results, undefined, handoff);
       return "ok";
     })();
   }

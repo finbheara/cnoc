@@ -20,8 +20,10 @@ import {
 import { arch, cpus, freemem, homedir, loadavg, platform, totalmem } from "node:os";
 import { join, resolve } from "node:path";
 import { type Adapter, parseAdapter } from "../jobfile";
-import type { AttemptEnd, ClientMsg, Measured, Resources, ServerMsg, StageResult } from "../protocol";
+import type { AttemptEnd, ClientMsg, Measured, Resources, ServerMsg } from "../protocol";
 import { PROTOCOL, VERSION } from "../protocol";
+import { readResult } from "../report";
+import { cleanUsage } from "../usage";
 import { AttemptRunner, type AttemptState } from "./runner";
 import { Tmux } from "./tmux";
 
@@ -481,11 +483,14 @@ export class CnocClient {
       return Response.json({ ok: true, delivered: this.connected });
     }
     if (url.pathname === "/attempt/result" && req.method === "POST") {
-      const b = (await req.json()) as Partial<StageResult>;
-      if (b.status !== "done" && b.status !== "failed")
-        return Response.json({ error: "status must be done or failed" }, { status: 400 });
-      const accepted = runner.report({ status: b.status, summary: String(b.summary ?? ""), data: b.data });
-      return Response.json({ ok: true, accepted });
+      const result = readResult(await req.json());
+      if (typeof result === "string") return Response.json({ error: result }, { status: 400 });
+      return Response.json({ ok: true, accepted: runner.report(result) });
+    }
+    if (url.pathname === "/attempt/usage" && req.method === "POST") {
+      const usage = cleanUsage(((await req.json()) as { usage?: unknown }).usage);
+      if (usage) runner.snapshot(usage);
+      return Response.json({ ok: true, recorded: Boolean(usage) });
     }
     if (url.pathname.startsWith("/v1/")) {
       // A job may talk to the server (to submit follow-up jobs, say) without holding any credential of its own.

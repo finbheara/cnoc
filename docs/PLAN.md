@@ -46,7 +46,7 @@ In rough order of value.
 
 ### 2. Accounting
 
-- **Tokens and spend per attempt.** Nothing is collected yet. Options: an adapter `USAGE` step, the harness's own transcript, or a `mcx` adapter that already tracks it.
+- **Tokens per stage** are collected for Claude Code from the session's own transcript, when the agent runs `cnoc done`, `fail` or `handoff`, or from a `Stop` hook running `cnoc usage` (SPEC §5). Not yet: a collector for `codex`, prices or spend, totals per job or per host, and an incremental read (each call re-reads the whole transcript, bounded to a few seconds). Not exercised against a real Claude Code session through the client; the reader was checked against real transcripts on one machine.
 - **Per-job CPU and memory.** Only host-level load is measured.
 - **Budgets** that stop a job, and quota-aware admission for shared subscriptions. Pools cap concurrency today, not consumption.
 - **A stalled state** for a session waiting on a usage-limit reset. It currently just runs until its time limit.

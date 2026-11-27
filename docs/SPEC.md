@@ -131,14 +131,33 @@ Sessions run under `/bin/sh` on a dedicated tmux socket named `cnoc`, with the c
 Each session has on its `PATH`:
 
 ```
-cnoc progress "note"      # a changelog event; best effort
-cnoc done "summary"       # the stage succeeded
-cnoc fail "reason"        # the stage failed
+cnoc progress "note"                # a changelog event; best effort
+cnoc done "summary"                 # the stage succeeded
+cnoc fail "reason"                  # the stage failed
+cnoc handoff MERGED [-m "note"]     # succeeded, and says how the work was left
+cnoc handoff BLOCKED -m "reason"    # failed, the same way; the message is required
+cnoc usage                          # record token usage so far; does not end the stage
 ```
 
-- The first `done` or `fail` for a stage wins; later ones are ignored.
+- The first `done`, `fail` or `handoff` for a stage wins; later ones are ignored.
 - A stage that ends with no report is `failed` with reason `no-result`.
 - A project may call these from a stop hook so a result is reported even when the agent forgets.
+- The instructions appended to a prompt (`${REPORT}`) tell the agent to use the closing command its prompt names, and `done` or `fail` only if it names none.
+
+**Handoff.** The status is read in any case and stored upper case in the stage result's `handoff` field. The set is fixed in the code (`MERGED` → `done`, `BLOCKED` → `failed`); anything else is refused with the list. It is not the `blocked` job state.
+
+**Usage.** `done`, `fail` and `handoff` attach the calling session's token usage to the result when they can read it. A collector per harness finds the session; only Claude Code has one. It takes the session id from `CLAUDE_CODE_SESSION_ID`, reads `<config>/projects/*/<id>.jsonl` (config is `$CLAUDE_CONFIG_DIR` or `~/.claude`) and every `*.jsonl` under `<id>/subagents/`, as a stream with a time limit. Claude Code writes a line per content block and repeats the response's usage on each under one `message.id`, with a smaller `output_tokens` on early blocks and not always in order; each id is counted once, at the largest value of each count, across all of the session's files. Lines that are not `assistant` entries with usage, and entries whose counts are all zero, are ignored.
+
+```
+usage: { harness, session, responses, at,
+         tokens:   { input, output, cache_creation, cache_read },
+         by_model: { <model>: { input, output, cache_creation, cache_read } },
+         partial?: "why the numbers are a lower bound" }
+```
+
+- No session, no transcript or an unreadable file means no `usage`; the result is never refused for it. A time limit or an unparseable line that carried usage gives `partial`.
+- `cnoc usage` is for a Claude Code `Stop` hook: it takes `session_id` and `transcript_path` from the hook's JSON on stdin when present, is silent and always exits 0. The client keeps the latest snapshot per stage. A report without usage takes it; a stage that ends with no report (no result, time limit, cancel) gets a result `{ status: "failed", summary: <reason>, reported: false, usage }` so the numbers are not lost.
+- A session does not inherit a harness session variable from the client's own environment; a job's `ENV` may set one.
 - The commands talk to the client over a local socket using a per-attempt token. A job holds no server credential.
 - The same socket forwards server API calls, so a job can submit follow-up jobs. They are recorded as submitted by the host.
 
@@ -196,7 +215,7 @@ One WebSocket per host, JSON messages, opened by the client at `/v1/client`.
 | client → server | `decline` | The host will not run it, with a reason. |
 | client → server | `started` | The first session exists. |
 | client → server | `progress` | A note from the harness. |
-| client → server | `ended` | Outcome, reason and per-stage results. |
+| client → server | `ended` | Outcome, reason and per-stage results, each with its optional `handoff` and `usage` (§5). |
 | server → client | `ack` | The `ended` was recorded. |
 | server → client | `cancel` | Stop this attempt. |
 
@@ -246,7 +265,7 @@ Bearer token on every call except health. The admin token may do everything. A h
 |---|---|
 | `POST /v1/jobs` | Submit. Body is one Jobfile as text, or `{ "jobs": [text...], "overrides"?: { on, priority, begin } }` as an atomic batch. |
 | `GET /v1/jobs` | Non-terminal jobs. `?all=1`, `?state=a,b`, `?project=`. |
-| `GET /v1/job?id=` | One job with its text and attempts. |
+| `GET /v1/job?id=` | One job with its text and attempts. Each stage in `result` may carry `handoff` and `usage` (§5). |
 | `POST /v1/job/cancel?id=` | Cancel. Immediate before start; a request to the host after. |
 | `POST /v1/job/requeue?id=` | Run a failed or cancelled job again. |
 | `POST /v1/job/abandon?id=` | Admin. Give up on a running job whose host is offline. |
@@ -281,8 +300,8 @@ Each event is `{ seq, ts, type, job, attempt, host, actor, data }`. `seq` increa
 | `job.priority` | A waiting job's priority was changed. |
 | `template.added`, `.updated`, `.removed` | A template changed. |
 | `template.run` | A template started a job; the event names the job, the arguments and the key, if any. A keyed run that changed nothing has no event. |
-| `job.terminal` | The job is `done`, `failed` or `cancelled`. |
-| `attempt.assigned`, `.returned`, `.started`, `.progress`, `.ended` | The life of one attempt. |
+| `job.terminal` | The job is `done`, `failed` or `cancelled`. Data: `state`, `reason`, and `handoff` when the last stage was handed off. |
+| `attempt.assigned`, `.returned`, `.started`, `.progress`, `.ended` | The life of one attempt. `.ended` data: `outcome`, `reason`, `handoff` as above, and `usage`, one entry per stage result (null where none), when any stage has usage. |
 | `attempt.late_report` | A result arrived for an attempt that was no longer open. It is not applied. |
 | `host.pending`, `.approved`, `.online`, `.offline`, `.drained`, `.undrained` | Host lifecycle. |
 
