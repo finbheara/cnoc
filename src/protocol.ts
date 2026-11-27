@@ -32,9 +32,20 @@ export interface JobSpec {
   depends: string[];
   /** Wall-clock limit for the whole job, seconds. */
   time_s: number | null;
+  /** The job may not start before this time, epoch milliseconds. Absent on jobs from older servers. */
+  begin_at?: number | null;
   labels: Record<string, string>;
   env: Record<string, string>;
   stages: Stage[];
+}
+
+/** Scheduling fields a submitter may set without editing the Jobfile. */
+export interface Overrides {
+  /** Run only on this host. */
+  on?: string;
+  priority?: number;
+  /** Same forms as the `begin` front matter key. */
+  begin?: string;
 }
 
 export interface StageResult {

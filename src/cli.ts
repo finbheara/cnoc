@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { CnocClient, loadClientConfig } from "./client/client";
-import { JobfileError, parseJob } from "./jobfile";
-import { type ChangeEvent, PROTOCOL, VERSION } from "./protocol";
+import { JobfileError, checkTemplate, parseJob } from "./jobfile";
+import { type ChangeEvent, type Overrides, PROTOCOL, VERSION } from "./protocol";
 import { CnocServer, type ServerOptions } from "./server/server";
 
 const HELP = `cnoc ${VERSION} - batch scheduling of agent harness sessions across persistent hosts
@@ -15,11 +15,25 @@ Run the services
   cnoc ingest DIR [--interval SECONDS]     submit every *.job under DIR/jobs, pulling DIR first if it is a git checkout
 
 Jobs
-  cnoc check FILE...                       validate Jobfiles without a server
-  cnoc submit FILE...                      submit as one atomic batch
+  cnoc check FILE...                       validate Jobfiles and templates without a server
+  cnoc submit FILE... [WHEN AND WHERE]     submit as one atomic batch
   cnoc queue [--all] [--json]              what is waiting and running
   cnoc show ID [--json]
   cnoc cancel ID | requeue ID | abandon ID
+  cnoc priority ID N                       move a job that has not been dispatched; higher goes first
+
+Templates (cnoc t is short for cnoc template)
+  cnoc template add FILE...                save a Jobfile so it can be started again and again
+  cnoc template list
+  cnoc template show REF
+  cnoc template run REF [--set NAME=VALUE]... [WHEN AND WHERE]
+  cnoc template rm REF                     REF is the number, the name, or the file it was added from
+
+When and where, for submit and template run
+  --on HOST                                only this host
+  --priority N                             higher goes first; a running job is never interrupted
+  --at TIME                                not before this local time: 03:00, or 2027-01-31T03:00
+  --after DURATION                         not before this long from now: 90m, 2h
 
 Hosts
   cnoc hosts [--json]
@@ -37,22 +51,26 @@ Inside a job (the harness calls these)
 Connection: CNOC_URL and CNOC_TOKEN, or ~/.config/cnoc/cli.json { "url", "token" }.
 Inside a job the client's local socket is used and no credential is needed.`;
 
-function parseArgs(argv: string[]): { pos: string[]; flags: Record<string, string | true> } {
+function parseArgs(argv: string[]): { pos: string[]; flags: Record<string, string | true>; sets: string[] } {
   const pos: string[] = [];
   const flags: Record<string, string | true> = {};
+  /** Every value of --set, which may be given more than once. */
+  const sets: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
     if (!a.startsWith("--")) {
       pos.push(a);
       continue;
     }
-    const [k, inline] = a.slice(2).split("=", 2) as [string, string | undefined];
+    const eq = a.indexOf("=");
+    const [k, inline] = eq < 0 ? [a.slice(2), undefined] : [a.slice(2, eq), a.slice(eq + 1)];
     const next = argv[i + 1];
     if (inline !== undefined) flags[k] = inline;
     else if (next !== undefined && !next.startsWith("--") && !BOOLEAN.has(k)) flags[k] = argv[++i] as string;
     else flags[k] = true;
+    if (k === "set" && typeof flags[k] === "string") sets.push(flags[k] as string);
   }
-  return { pos, flags };
+  return { pos, flags, sets };
 }
 const BOOLEAN = new Set(["all", "json", "follow", "open-enrollment", "help"]);
 const home = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
@@ -111,6 +129,40 @@ function jobFiles(dir: string): string[] {
   return out;
 }
 
+/** The scheduling flags shared by submit and template run. --at is read in this machine's time zone. */
+function overrides(flags: Record<string, string | true>): Overrides {
+  const out: Overrides = {};
+  if (typeof flags.on === "string") out.on = flags.on;
+  if (flags.priority !== undefined) {
+    out.priority = Number(flags.priority);
+    if (!Number.isInteger(out.priority)) throw new CliError("--priority takes a whole number");
+  }
+  if (flags.at !== undefined && flags.after !== undefined) throw new CliError("give --at or --after, not both");
+  if (typeof flags.after === "string") out.begin = `+${flags.after.replace(/^\+/, "")}`;
+  if (typeof flags.at === "string") {
+    const clock = flags.at.match(/^(\d{1,2}):(\d{2})$/);
+    let when = new Date(flags.at);
+    if (clock) {
+      when = new Date();
+      when.setHours(Number(clock[1]), Number(clock[2]), 0, 0);
+      if (when.getTime() <= Date.now()) when.setDate(when.getDate() + 1);
+    }
+    if (Number.isNaN(when.getTime())) throw new CliError(`cannot read --at ${flags.at}; use 03:00 or 2027-01-31T03:00`);
+    out.begin = when.toISOString();
+  }
+  return out;
+}
+
+const clock = (ms: number): string => {
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+
+/** Why a job is waiting, for the queue listing. */
+const why = (j: { reason?: string | null; pending_reason?: string | null; begin_at?: number | null }): string =>
+  j.reason ?? (j.pending_reason === "scheduled" && j.begin_at ? `not before ${clock(j.begin_at)}` : (j.pending_reason ?? ""));
+
 function printEvent(e: ChangeEvent): void {
   const who = [e.job, e.attempt !== null ? `#${e.attempt}` : null, e.host ? `@${e.host}` : null].filter(Boolean).join(" ");
   const data = e.data && Object.keys(e.data as object).length ? ` ${JSON.stringify(e.data)}` : "";
@@ -125,7 +177,7 @@ async function report(status: "done" | "failed", summary: string): Promise<void>
 
 async function main(): Promise<void> {
   const [cmd = "help", ...rest] = process.argv.slice(2);
-  const { pos, flags } = parseArgs(rest);
+  const { pos, flags, sets } = parseArgs(rest);
   const asJson = flags.json === true;
   const need = (i: number, what: string): string => {
     const v = pos[i];
@@ -170,7 +222,14 @@ async function main(): Promise<void> {
       let bad = 0;
       for (const f of pos) {
         try {
-          const spec = parseJob(readFileSync(f, "utf8"));
+          const text = readFileSync(f, "utf8");
+          if (/^\s*ARG\s/im.test(text)) {
+            const t = checkTemplate(text);
+            const args = t.args.map((a) => (a.default === null ? a.name : `${a.name}=${a.default}`)).join(", ");
+            console.log(`ok    ${f}  (template ${t.name}; arguments: ${args})`);
+            continue;
+          }
+          const spec = parseJob(text);
           console.log(`ok    ${f}  (${spec.id}, ${spec.stages.length} stage${spec.stages.length === 1 ? "" : "s"})`);
         } catch (e) {
           if (!(e instanceof JobfileError)) throw e;
@@ -185,9 +244,68 @@ async function main(): Promise<void> {
 
     case "submit": {
       need(0, "FILE");
-      const r = await api("POST", "/v1/jobs", { jobs: pos.map((f) => readFileSync(f, "utf8")) });
+      const r = await api("POST", "/v1/jobs", { jobs: pos.map((f) => readFileSync(f, "utf8")), overrides: overrides(flags) });
       for (const j of r.jobs) console.log(`${j.created ? "submitted" : "unchanged"}  ${j.id}  ${j.state}`);
       return;
+    }
+
+    case "template":
+    case "t": {
+      const sub = pos[0] ?? "list";
+      const ref = () => {
+        const v = need(1, "REF (a template's number, name or file)");
+        // A file path is also sent resolved, so `rm` finds the template from any directory.
+        return `ref=${encodeURIComponent(v)}${/^\d+$/.test(v) ? "" : `&path=${encodeURIComponent(resolve(v))}`}`;
+      };
+      const args = (t: { args: Array<{ name: string; default: string | null }> }) =>
+        t.args.map((a) => (a.default === null ? a.name : `${a.name}=${a.default}`)).join(" ") || "-";
+      switch (sub) {
+        case "add": {
+          need(1, "FILE");
+          for (const f of pos.slice(1)) {
+            const r = await api("POST", "/v1/templates", { text: readFileSync(f, "utf8"), source: resolve(f) });
+            console.log(`${r.template.id}  ${r.template.name}  ${r.result}`);
+          }
+          return;
+        }
+        case "list":
+        case "ls": {
+          const r = await api("GET", "/v1/templates");
+          if (asJson) return console.log(JSON.stringify(r, null, 2));
+          if (r.templates.length === 0) return console.log("no templates; add one with: cnoc template add FILE");
+          const rows = [["ID", "NAME", "ARGUMENTS", "RUNS", "LAST RUN", "FROM"]];
+          for (const t of r.templates) rows.push([String(t.id), t.name, args(t), String(t.runs), t.last_run_at ? `${age(t.last_run_at)} ago` : "-", t.source ?? "-"]);
+          return console.log(table(rows));
+        }
+        case "show": {
+          const r = await api("GET", `/v1/template?${ref()}`);
+          if (asJson) return console.log(JSON.stringify(r, null, 2));
+          console.log(`# template ${r.template.id}: ${r.template.name}   arguments: ${args(r.template)}   runs: ${r.template.runs}`);
+          return console.log(r.template.body.trimEnd());
+        }
+        case "run": {
+          const set: Record<string, string> = {};
+          for (const kv of sets) {
+            const i = kv.indexOf("=");
+            if (i < 1) throw new CliError(`--set takes NAME=VALUE, got ${kv}`);
+            set[kv.slice(0, i)] = kv.slice(i + 1);
+          }
+          const r = await api("POST", `/v1/template/run?${ref()}`, { set, overrides: overrides(flags) });
+          return console.log(`submitted  ${r.job.id}  ${r.job.state}${why(r.job) ? `  (${why(r.job)})` : ""}`);
+        }
+        case "rm":
+        case "remove": {
+          const r = await api("DELETE", `/v1/template?${ref()}`);
+          return console.log(`removed  ${r.template.id}  ${r.template.name}`);
+        }
+        default:
+          throw new CliError(`unknown template command: ${sub} (add, list, show, run, rm)`);
+      }
+    }
+
+    case "priority": {
+      const r = await api("POST", `/v1/job/priority?id=${encodeURIComponent(need(0, "ID"))}&value=${encodeURIComponent(need(1, "N"))}`);
+      return console.log(`${r.job.id}  priority ${r.job.priority}  ${r.job.state}`);
     }
 
     case "ingest": {
@@ -225,7 +343,7 @@ async function main(): Promise<void> {
       if (asJson) return console.log(JSON.stringify(r, null, 2));
       if (r.jobs.length === 0) return console.log("nothing queued or running");
       const rows = [["JOB", "STATE", "HOST", "PRIO", "AGE", "WHY"]];
-      for (const j of r.jobs) rows.push([j.id, j.state, j.host ?? "-", String(j.priority), age(j.submitted_at), j.reason ?? j.pending_reason ?? ""]);
+      for (const j of r.jobs) rows.push([j.id, j.state, j.host ?? "-", String(j.priority), age(j.submitted_at), why(j)]);
       return console.log(table(rows));
     }
 
@@ -235,6 +353,8 @@ async function main(): Promise<void> {
       const j = r.job;
       console.log(`${j.id}  ${j.state}${j.reason ? `  (${j.reason})` : ""}${j.pending_reason ? `  waiting: ${j.pending_reason}` : ""}`);
       console.log(`project ${j.project}  priority ${j.priority}  resources ${JSON.stringify(j.resources)}  depends ${JSON.stringify(j.depends)}`);
+      if (j.requires?.length) console.log(`requires ${j.requires.join(", ")}`);
+      if (j.begin_at) console.log(`not before ${new Date(j.begin_at).toLocaleString()}`);
       for (const a of r.attempts) console.log(`  attempt ${a.id} on ${a.host}: ${a.state}${a.outcome ? ` ${a.outcome}` : ""}${a.reason ? ` (${a.reason})` : ""}`);
       for (const [i, s] of ((j.result as Array<{ status: string; summary: string }> | null) ?? []).entries()) console.log(`  stage ${i + 1}: ${s.status}  ${s.summary}`);
       return;

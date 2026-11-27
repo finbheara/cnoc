@@ -41,7 +41,7 @@ export interface Adapter {
 
 const ID_RE = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._#-]+)*$/;
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
-const FRONT_KEYS = new Set(["id", "priority", "resources", "requires", "depends", "time", "labels"]);
+const FRONT_KEYS = new Set(["id", "priority", "resources", "requires", "depends", "time", "begin", "labels"]);
 const JOB_RESERVED = new Set(["RUN", "WORKTREE", "WORKDIR"]);
 const ADAPTER_ONLY = new Set(["TMUX", "EXPECT", "TYPE", "SLEEP", "STOP", "REQUIRE"]);
 
@@ -54,6 +54,18 @@ export function parseDuration(v: unknown): number {
   const total = Number(d ?? 0) * 86400 + Number(h ?? 0) * 3600 + Number(min ?? 0) * 60 + Number(s ?? 0);
   if (total <= 0) throw new JobfileError(`bad duration: ${v}`);
   return total;
+}
+
+/**
+ * When a job may first start: a time with a zone, or `+duration` counted from `now`.
+ * A time without a zone is refused, because the submitter and the server may not share one.
+ */
+export function parseBegin(v: unknown, now: number): number {
+  const s = typeof v === "string" ? v.trim() : "";
+  if (s.startsWith("+")) return now + parseDuration(s.slice(1)) * 1000;
+  const t = /(Z|[+-]\d\d:?\d\d)$/i.test(s) ? Date.parse(s) : Number.NaN;
+  if (Number.isNaN(t)) throw new JobfileError(`begin must be a time with a zone, such as 2027-01-31T03:00:00Z, or a delay such as +2h; got ${JSON.stringify(v)}`);
+  return t;
 }
 
 function splitFrontMatter(text: string): { front: string | null; body: string; bodyLine: number } {
@@ -152,9 +164,13 @@ function stringList(v: unknown, what: string): string[] {
   return v.map(String);
 }
 
-export function parseJob(text: string): JobSpec {
+export function parseJob(text: string, now = Date.now()): JobSpec {
   const { front, body, bodyLine } = splitFrontMatter(text);
   if (front === null) throw new JobfileError("missing front matter (--- ... ---) with at least an id", 1);
+  const instrs = instructions(body, bodyLine);
+  // Checked before the front matter, which an unfilled argument can make unreadable.
+  const arg = instrs.find((i) => i.verb === "ARG");
+  if (arg) throw new JobfileError("ARG makes this a template; add it with `cnoc template add` and start it with `cnoc template run`", arg.line);
   let fm: Record<string, unknown>;
   try {
     fm = (YAML.parse(front) ?? {}) as Record<string, unknown>;
@@ -181,7 +197,7 @@ export function parseJob(text: string): JobSpec {
   let harness: { name: string; args: string } | null = null;
   const env: Record<string, string> = {};
   const stages: Stage[] = [];
-  for (const ins of instructions(body, bodyLine)) {
+  for (const ins of instrs) {
     switch (ins.verb) {
       case "FROM":
         if (project !== null) throw new JobfileError("FROM may appear only once", ins.line);
@@ -224,10 +240,76 @@ export function parseJob(text: string): JobSpec {
     requires: stringList(fm.requires, "requires"),
     depends,
     time_s: fm.time === undefined || fm.time === null ? null : parseDuration(fm.time),
+    begin_at: fm.begin === undefined || fm.begin === null ? null : parseBegin(fm.begin, now),
     labels,
     env,
     stages,
   };
+}
+
+// ---- templates --------------------------------------------------------------
+
+export interface TemplateArg {
+  name: string;
+  /** null when the argument must be given at run time. */
+  default: string | null;
+}
+
+const ARG_RE = /^([A-Z_][A-Z0-9_]*)(?:=([\s\S]*))?$/;
+
+function argLines(text: string): Array<TemplateArg & { line: number }> {
+  const { body, bodyLine } = splitFrontMatter(text);
+  const out: Array<TemplateArg & { line: number }> = [];
+  for (const ins of instructions(body, bodyLine)) {
+    if (ins.verb !== "ARG") continue;
+    const m = ins.rest.match(ARG_RE);
+    if (!m) throw new JobfileError("ARG takes NAME or NAME=default, with the name in capitals", ins.line);
+    const name = m[1] as string;
+    if (out.some((a) => a.name === name)) throw new JobfileError(`ARG ${name} is declared twice`, ins.line);
+    out.push({ name, default: m[2] === undefined ? null : oneString(m[2], ins.line), line: ins.line });
+  }
+  return out;
+}
+
+/**
+ * Turns a template into a Jobfile: fills every `${NAME}` that an ARG line declares, drops
+ * the ARG lines and, if asked, replaces the id. Names that are not declared are left alone,
+ * so shell variables in a prompt pass through.
+ */
+export function instantiate(text: string, set: Record<string, string>, id?: string): string {
+  const args = argLines(text);
+  for (const k of Object.keys(set)) {
+    if (!args.some((a) => a.name === k)) throw new JobfileError(`unknown argument ${k}; this template takes: ${args.map((a) => a.name).join(", ") || "none"}`);
+  }
+  const values = new Map<string, string>();
+  for (const a of args) {
+    const v = set[a.name] ?? a.default;
+    if (v === null || v === undefined) throw new JobfileError(`argument ${a.name} has no default and was not set`);
+    if (/[\r\n]/.test(v)) throw new JobfileError(`argument ${a.name} must be a single line`);
+    values.set(a.name, v);
+  }
+  const lines = text.split(/\r?\n/);
+  for (const a of args) {
+    if ((lines[a.line - 1] ?? "").endsWith("\\")) throw new JobfileError("ARG must fit on one line", a.line);
+    lines[a.line - 1] = ""; // blanked, not removed, so later errors keep their line numbers
+  }
+  if (id !== undefined) {
+    const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
+    const at = lines.findIndex((l, i) => i > 0 && i < end && /^id\s*:/.test(l));
+    if (lines[0]?.trim() !== "---" || at < 0) throw new JobfileError("a template needs front matter with its own `id:` line");
+    lines[at] = `id: ${id}`;
+  }
+  return lines.join("\n").replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => values.get(name) ?? whole);
+}
+
+/** Validates a template as far as it can be without real arguments. Its id is its name. */
+export function checkTemplate(text: string): { name: string; args: TemplateArg[] } {
+  const args = argLines(text).map(({ name, default: d }) => ({ name, default: d }));
+  const { front } = splitFrontMatter(text);
+  if (/^id\s*:.*\$\{/m.test(front ?? "")) throw new JobfileError("a template's id is its name and cannot contain an argument");
+  // Arguments without a default are tried as "1", which is a valid name, count and duration.
+  const trial = Object.fromEntries(args.filter((a) => a.default === null).map((a) => [a.name, "1"]));
+  return { name: parseJob(instantiate(text, trial)).id, args };
 }
 
 function terminalStep(verb: string, rest: string, line: number): Step {

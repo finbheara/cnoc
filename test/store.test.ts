@@ -100,3 +100,77 @@ test("every mutation advances the changelog in order", () => {
   expect(ev.map((e) => e.type)).toEqual(["host.approved", "job.submitted", "attempt.assigned", "attempt.started", "attempt.ended", "job.terminal"]);
   expect(s.events(4).map((e) => e.type)).toEqual(["attempt.ended", "job.terminal"]);
 });
+
+// ---- overrides, priority, templates --------------------------------------------
+
+const T = (name: string, body = "PROMPT true") => `---\nid: ${name}\n---\nARG PROJECT\nARG NOTE=hi\nFROM \${PROJECT}\nHARNESS shell\n${body}\n`;
+
+test("overrides pin a host, set priority and delay the start", () => {
+  s.submit([J("a")], "t", { on: "h", priority: 7, begin: "+1h" });
+  const spec = s.job("a")?.spec;
+  expect(spec?.requires).toEqual(["host/h"]);
+  expect(spec?.priority).toBe(7);
+  expect(spec?.begin_at).toBeGreaterThan(Date.now() + 3_590_000);
+  expect(() => s.submit([J("b")], "t", { on: "nowhere" })).toThrow(/no such host: nowhere/);
+  expect(() => s.submit([J("b")], "t", { begin: "noon" })).toThrow(/time with a zone/);
+  expect(s.job("b")).toBeNull();
+});
+
+test("priority can change until a job is dispatched", () => {
+  s.submit([J("a"), J("b", ["a"])], "t");
+  expect(s.setPriority("b", 5, "t").spec.priority).toBe(5);
+  expect(s.events(0).filter((e) => e.type === "job.priority").map((e) => e.data)).toEqual([{ from: 0, to: 5 }]);
+  s.assign("a", "h");
+  expect(() => s.setPriority("a", 9, "t")).toThrow(/only a job that has not been dispatched/);
+  expect(() => s.setPriority("nope", 1, "t")).toThrow(/no such job/);
+  expect(() => s.setPriority("b", 1.5, "t")).toThrow(/integer/);
+});
+
+test("a template is added once, updated in place and found by number, name or file", () => {
+  const first = s.templateAdd(T("clean"), "/repo/templates/clean.job", "t");
+  expect(first.result).toBe("added");
+  expect(first.template.args).toEqual([
+    { name: "PROJECT", default: null },
+    { name: "NOTE", default: "hi" },
+  ]);
+  expect(s.templateAdd(T("clean"), "/repo/templates/clean.job", "t").result).toBe("unchanged");
+  const second = s.templateAdd(T("clean", "PROMPT false"), "/repo/templates/clean.job", "t");
+  expect(second).toMatchObject({ result: "updated", template: { id: first.template.id } });
+  for (const ref of [String(first.template.id), "clean", "/repo/templates/clean.job"]) expect(s.template(ref)?.name).toBe("clean");
+  expect(s.template("templates/clean.job", "/repo/templates/clean.job")?.name).toBe("clean");
+  expect(s.template("other")).toBeNull();
+  expect(() => s.templateAdd("---\nid: x\n---\nARG lower\nFROM a\nHARNESS shell\nPROMPT true\n", null, "t")).toThrow(/ARG takes NAME/);
+});
+
+test("running a template submits a numbered job each time", () => {
+  s.templateAdd(T("clean", 'PROMPT "echo ${NOTE}"'), null, "t");
+  const one = s.templateRun("clean", { PROJECT: "app" }, { on: "h" }, "t");
+  const two = s.templateRun("1", { PROJECT: "app", NOTE: "again" }, {}, "t");
+  expect([one.job, two.job]).toEqual(["clean/1", "clean/2"]);
+  expect(s.job("clean/1")?.spec).toMatchObject({ project: "app", requires: ["host/h"], labels: { template: "clean" }, stages: [{ prompt: "echo hi" }] });
+  expect(s.job("clean/2")?.spec.stages[0]?.prompt).toBe("echo again");
+  expect(two.template).toMatchObject({ runs: 2, last_job: "clean/2" });
+  expect(() => s.templateRun("clean", {}, {}, "t")).toThrow(/PROJECT has no default/);
+  expect(() => s.templateRun("clean", { PROJECT: "app", X: "1" }, {}, "t")).toThrow(/unknown argument X/);
+  expect(() => s.templateRun("gone", {}, {}, "t")).toThrow(/no such template/);
+  // A failed run takes no number and leaves no job behind.
+  expect(s.templateRun("clean", { PROJECT: "app" }, {}, "t").job).toBe("clean/3");
+});
+
+test("a removed and re-added template does not reuse job ids", () => {
+  s.templateAdd(T("clean"), "/repo/clean.job", "t");
+  s.templateRun("clean", { PROJECT: "app" }, {}, "t");
+  expect(s.templateRemove("clean.job", "/repo/clean.job", "t").name).toBe("clean");
+  expect(s.templates()).toEqual([]);
+  expect(() => s.templateRemove("clean", undefined, "t")).toThrow(/no such template/);
+  const again = s.templateAdd(T("clean"), null, "t");
+  expect(again.template.id).toBe(2);
+  expect(s.templateRun("clean", { PROJECT: "app" }, {}, "t").job).toBe("clean/2");
+  expect(s.events(0).map((e) => e.type).filter((t) => t.startsWith("template."))).toEqual([
+    "template.added",
+    "template.run",
+    "template.removed",
+    "template.added",
+    "template.run",
+  ]);
+});

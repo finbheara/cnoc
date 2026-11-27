@@ -375,3 +375,72 @@ test("requests without a valid token are refused", async () => {
   expect(res.status).toBe(401);
   expect((await fetch(`${server.url}/v1/health`)).status).toBe(200);
 });
+
+test("a template runs again and again, with arguments, pinned to a host", async () => {
+  const name = `tpl-${++seq}`;
+  const text = `---\nid: ${name}\n---\nARG WORD\nARG FILE=tpl.txt\nFROM proj\nHARNESS shell\nPROMPT "echo \${WORD} >> \${FILE}; cnoc done \\"wrote \${WORD} as $USER\\""\n`;
+  const pin = await newClient("pin", { features: ["host/alpha"] }).start();
+  try {
+    await until("pin online", async () => (await api("GET", "/v1/hosts")).hosts.find((h: any) => h.name === "pin" && h.online));
+    // A host cannot claim to be another one.
+    const hosts = (await api("GET", "/v1/hosts")).hosts;
+    expect(hosts.find((h: any) => h.name === "pin").features.filter((f: string) => f.startsWith("host/"))).toEqual(["host/pin"]);
+
+    const added = await api("POST", "/v1/templates", { text, source: "/somewhere/tpl.job" });
+    expect(added).toMatchObject({ status: 200, result: "added", template: { name, args: [{ name: "WORD", default: null }, { name: "FILE", default: "tpl.txt" }] } });
+    expect((await api("GET", "/v1/templates")).templates.map((t: any) => t.name)).toContain(name);
+
+    const runs = [];
+    for (const word of ["one", "two", "three"]) runs.push(await api("POST", `/v1/template/run?ref=${added.template.id}`, { set: { WORD: word }, overrides: { on: "pin" } }));
+    expect(runs.map((r) => r.job.id)).toEqual([`${name}/1`, `${name}/2`, `${name}/3`]);
+    for (const r of runs) {
+      const done = await reaches(r.job.id, "done");
+      expect(done.requires).toEqual(["host/pin"]);
+      expect(done.labels).toEqual({ template: name });
+    }
+    const ev = await events();
+    expect(ev.filter((e) => e.type === "attempt.started" && e.job?.startsWith(`${name}/`)).map((e) => e.host)).toEqual(["pin", "pin", "pin"]);
+    expect(readFileSync(join(project, "tpl.txt"), "utf8").split("\n").filter(Boolean).sort()).toEqual(["one", "three", "two"]);
+    expect((await state(`${name}/1`)).result[0].summary).toMatch(/^wrote one as \S+$/);
+
+    expect((await api("POST", `/v1/template/run?ref=${name}`, { set: {} })).error).toMatch(/WORD has no default/);
+    expect((await api("POST", `/v1/template/run?ref=${name}`, { set: { WORD: "x" }, overrides: { on: "nowhere" } })).status).toBe(404);
+    expect((await api("DELETE", `/v1/template?ref=tpl.job&path=${encodeURIComponent("/somewhere/tpl.job")}`)).template.name).toBe(name);
+    expect((await api("GET", `/v1/template?ref=${name}`)).status).toBe(404);
+  } finally {
+    await pin.stop();
+  }
+}, 40_000);
+
+test("a job with a begin time waits for it", async () => {
+  const j = id("later");
+  const r = await api("POST", "/v1/jobs", { jobs: [job(j, "true")], overrides: { begin: "+3s" } });
+  const submitted = Date.now();
+  expect(r.jobs[0]).toMatchObject({ id: j, state: "queued" });
+  const waiting = await until("the job to be listed as scheduled", async () => {
+    const s = await state(j);
+    return s.pending_reason === "scheduled" ? s : false;
+  });
+  expect(waiting.begin_at).toBeGreaterThan(submitted + 2000);
+  await reaches(j, "done");
+  const started = (await events()).find((e) => e.type === "attempt.started" && e.job === j);
+  expect(started?.ts).toBeGreaterThanOrEqual(waiting.begin_at);
+}, 30_000);
+
+test("raising a queued job's priority moves it ahead; a running job is not interrupted", async () => {
+  const [holder, plain, urgent] = [id("holder"), id("plain"), id("urgent")];
+  const solo = "resources: { solo: 1 }";
+  await submit(job(holder, "sleep 1.5", solo));
+  await reaches(holder, "running");
+  await submit(job(plain, "true", solo));
+  await submit(job(urgent, "true", solo));
+  expect((await api("POST", `/v1/job/priority?id=${encodeURIComponent(urgent)}&value=5`)).job.priority).toBe(5);
+  expect((await api("POST", `/v1/job/priority?id=${encodeURIComponent(holder)}&value=9`)).status).toBe(409);
+  await reaches(plain, "done");
+  await reaches(urgent, "done");
+  const ev = await events();
+  const startedAt = (jobId: string) => ev.findIndex((e) => e.type === "attempt.started" && e.job === jobId);
+  expect(startedAt(holder)).toBeLessThan(startedAt(urgent));
+  expect(startedAt(urgent)).toBeLessThan(startedAt(plain));
+  expect(ev.find((e) => e.type === "job.terminal" && e.job === holder)?.data).toMatchObject({ state: "done" });
+}, 30_000);
