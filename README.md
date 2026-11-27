@@ -282,6 +282,33 @@ Every state change is one numbered event. Read it three ways:
 
 `cnoc ingest DIR --interval 60` pulls a checkout and submits every `*.job` under `DIR/jobs` as one batch. Submitting the same file again does nothing, and a changed file is refused, so merged job files are immutable. Whoever can merge to that repository can run prompts on your hosts; protect the branch accordingly.
 
+## Jobs from a backlog
+
+Cnoc does not know what a backlog is. `cnoc feed` runs a command you give it, and that command prints the backlog as one template run per line:
+
+```
+{"template":"lane","key":"myapp-1234","set":{"PROJECT":"myapp","ISSUE":"1234"}}
+```
+
+A typical path from an issue to a job:
+
+1. Someone puts a label such as `ready-for-agent` on an issue.
+2. A source script lists the labelled issues. [examples/feed-github-issues.sh](examples/feed-github-issues.sh) does it with `gh issue list`.
+3. `cnoc feed` submits each line as a keyed run of the template: the job is named `<template>/<key>`, here `lane/myapp-1234`.
+4. The next pass offers the same issue again. Its key exists, so nothing happens. Only issues not seen before become jobs.
+
+```
+cnoc feed --every 5m -- examples/feed-github-issues.sh example-org/myapp ready-for-agent lane
+cnoc feed --dry-run -- examples/feed-github-issues.sh example-org/myapp ready-for-agent lane
+```
+
+- `template` is required. `key` may be left out when the template declares its own key; a line with neither is rejected, so a pass can never create a fresh job each time. `set`, `priority`, `on` and `begin` are as for `cnoc template run`.
+- Without `--every` it makes one pass and exits, non-zero if the command failed or any line was rejected, which suits cron or a systemd timer. With `--every` it repeats, one pass at a time, and logs failures and carries on.
+- `--max N` (default 10) caps the new jobs a pass may create, so a source that suddenly lists a thousand items starts ten. The rest are created on later passes.
+- The command runs without a shell (use `sh -c '...'` if you need one) and has two minutes. If it fails or times out, nothing from that pass is submitted, even lines it printed. A bad line is reported with its line number and the other lines still go.
+- It prints a line per job it creates and one summary per pass, and nothing for items that already exist.
+- The feeder keeps no state. Removing the label stops an issue being offered but does not cancel its job. A job that failed stays failed: listing it again does nothing, and it runs again only when someone runs `cnoc requeue`.
+
 ## Development
 
 ```

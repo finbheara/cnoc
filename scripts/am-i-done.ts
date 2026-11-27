@@ -121,8 +121,8 @@ const JOBFILES: Step = {
 
 const SHELL: Step = {
   name: "shell",
-  description: "shellcheck over install.sh and the git hooks",
-  command: "shellcheck install.sh .git-hooks/pre-commit .git-hooks/pre-push",
+  description: "shellcheck over install.sh, the example feed source and the git hooks",
+  command: "shellcheck install.sh examples/feed-github-issues.sh .git-hooks/pre-commit .git-hooks/pre-push",
   onFailure: [
     "`shellcheck` not found: install it (brew install shellcheck, apt install shellcheck); the step is not optional",
     "otherwise fix what shellcheck reports; disable a finding only with a comment that says why",

@@ -16,7 +16,7 @@ Cnoc runs agent harness sessions as batch jobs across a small fleet of persisten
 
 **Out of scope**
 
-- A backlog, or any assumption about GitHub or an issue tracker. A job is self-contained.
+- A backlog, or any assumption about GitHub or an issue tracker. A job is self-contained. `cnoc feed` (§14) reads a backlog only through a command the operator supplies.
 - Planning. Each project plans its own work. A planning run is just another job, and a planner can subscribe to the changelog.
 - A definition of done, review, CI or merge policy. The agent reports its own result.
 - Pre-emption. A job that has started is never evicted by the scheduler.
@@ -345,3 +345,17 @@ Specified but not built:
 | No time-based "lost" | Agent work is not safe to run twice. A person decides when to give up on a host. |
 | Submitter-chosen ids | Dependencies and git files need to name a job before the server has seen it. |
 | Separate from mcp-cli | That daemon is a per-user developer tool with a different lifecycle and far more credentials. It can be a harness adapter, and later a second client of this protocol. |
+
+## 14. Feeding from a backlog
+
+`cnoc feed [--every DURATION] [--max N] [--dry-run] -- COMMAND [ARGS...]` is a client of the HTTP API. The server knows nothing about it.
+
+- COMMAND is executed directly, without a shell, with a two-minute limit. On expiry its whole process group is sent SIGTERM, then SIGKILL after a grace period.
+- Its standard output is JSON lines, one template run each: `{ "template", "key"?, "set"?, "priority"?, "on"?, "begin"? }`. `template` is a name or a number; `set` maps names to strings or numbers; the last three are the overrides of §3.4. Blank lines are skipped. A line that is not a JSON object, or has an unknown or ill-typed field, is reported with its line number and skipped.
+- Each valid line is sent to `POST /v1/template/run` with `keyed: true`, so the server refuses a run for which neither the line nor the template gives a key. A key that exists answers `created: false` and creates nothing. Offering the whole backlog every pass is therefore safe, and the feeder holds no state.
+- A command that exits non-zero, is killed or times out submits nothing from that pass.
+- `--max N`, default 10, stops a pass after N new jobs. Lines after that are not sent; they are offered again next pass.
+- A run the server refuses (400, 404, 409, 422) is reported with its line number and the pass goes on. Any other failure (no connection, a bad token, a server error) ends the pass. A response without `created` means the server does not support keyed runs; the feeder stops rather than create a job every pass.
+- Without `--every`: one pass, exit 1 if the command failed or any line was rejected. With it: passes start `DURATION` apart and never overlap; failures are logged and the loop goes on.
+- Output: one line per job created, one summary per pass (created, already there, rejected, held back). `--dry-run` runs the command and prints the runs it would offer, without contacting the server.
+- Nothing is retried by the feeder. A job that failed keeps its key, so it is not created again; `cnoc requeue` runs it again.

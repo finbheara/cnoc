@@ -18,6 +18,7 @@ Tested means covered by `bun test`: 155 tests of cnoc itself, 33 of them end to 
 | Updates | The version is the commit a process runs. A client on another version takes no work, checks out exactly the server's commit from its clone's `origin` and exits for its service manager; failures back off across restarts, and `cnoc hosts` shows each host's version and why it has not caught up. |
 | Git intake | `cnoc ingest` of a checkout's `jobs/` directory. |
 | Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. Keyed runs (`--key`, or `key:` in the template) start once however often they are offered; `keyed` refuses a run with no key. |
+| Feeding | `cnoc feed`: keyed template runs from a command's JSON lines, once or on an interval, with a per-pass cap, a command time limit, `--dry-run`, and a GitHub issues source in `examples/`. |
 | When and where | `begin` (a time or a delay), `--on HOST` through a `host/NAME` feature, priority at submit and on a waiting job. |
 | Gate | `bun am-i-done`: one ordered list of checks with a deadline, modes for the git hooks, and output kept out of an agent's context. `bun doing-it-wrong`: a rule engine with fifteen rules, each with fixtures. CI runs the gate on Linux and macOS, and both jobs are required on `main`. |
 | Client install | `install.sh`: clone, `cnoc` command, config, and a systemd user unit or launchd agent that leaves tmux sessions alone on restart. |
