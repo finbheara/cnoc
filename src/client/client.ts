@@ -22,7 +22,7 @@ import { join, resolve } from "node:path";
 import { type Adapter, parseAdapter } from "../jobfile";
 import type { AttemptEnd, ClientMsg, Measured, Resources, ServerMsg, StageResult } from "../protocol";
 import { PROTOCOL } from "../protocol";
-import { APP_ROOT, runningVersion } from "../version";
+import { APP_ROOT, runningVersion, runningVersionProblem } from "../version";
 import { AttemptRunner, type AttemptState } from "./runner";
 import { Tmux } from "./tmux";
 import { Updater } from "./update";
@@ -95,6 +95,8 @@ export class CnocClient {
     chmodSync(dir, 0o700);
     this.version = opts.version ?? runningVersion();
     this.log = opts.log ?? ((l) => console.log(`[client ${opts.config.name}] ${l}`));
+    const problem = opts.version === undefined ? runningVersionProblem() : null;
+    if (problem) this.log(`WARNING: ${problem}`);
     this.updater = new Updater({
       checkout: opts.checkout ?? APP_ROOT,
       stateDir: dir,
@@ -384,9 +386,14 @@ export class CnocClient {
     const wait = this.updater.dueIn(serverVersion);
     this.retryMs = Math.max(this.retryMs, Math.min(Math.max(wait, 5000), MISMATCH_RECHECK_MS));
     if (wait > 0) return;
-    void this.updater.attempt(serverVersion).then((restart) => {
-      if (restart) void this.stop().then(() => (this.opts.exit ?? process.exit)(75));
-    });
+    void this.updater
+      .attempt(serverVersion)
+      .then(async (restart) => {
+        if (!restart) return;
+        await this.stop();
+        (this.opts.exit ?? process.exit)(75);
+      })
+      .catch((e: Error) => this.log(`update failed: ${e.message}`));
   }
 
   private onAssign(msg: Extract<ServerMsg, { t: "assign" }>): void {

@@ -3,11 +3,12 @@
  * directories. The end-to-end path (a server restarting on a new commit) is in e2e.test.ts.
  */
 import { expect, test } from "bun:test";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { specTempDir } from "../scripts/testkit";
 import {
   LEGACY_UPDATE,
+  UPDATE_RESTART_LIMIT,
   UPDATE_RETRY_BASE_MS,
   UPDATE_RETRY_MAX_MS,
   UpdateError,
@@ -16,7 +17,7 @@ import {
   updateCheckout,
 } from "../src/client/update";
 import { VERSION } from "../src/protocol";
-import { checkoutOf, shortVersion, versionOf } from "../src/version";
+import { checkoutOf, shortVersion, versionOf, versionProblem } from "../src/version";
 import { commit, git, makeRepos } from "./git-fixture";
 
 const bun = process.execPath;
@@ -71,6 +72,8 @@ test("a version is shortened for people only when it is a commit", () => {
   expect(shortVersion(sha)).toBe("0123456");
   expect(shortVersion(`${sha}-dirty`)).toBe("0123456-dirty");
   expect(shortVersion("0.1.0")).toBe("0.1.0");
+  // Text from a server is never printed raw.
+  expect(shortVersion("\u001b[2Jx-dirty\nforged")).toBe('" [2Jx-dirty forged"');
   expect(shortVersion(null)).toBe("-");
 });
 
@@ -108,12 +111,17 @@ test("a version that is not a commit is never handed to git", async () => {
   await expect(updateCheckout(clone, "0.1.0", bun)).rejects.toThrow(/not a git commit/);
   await expect(updateCheckout(clone, "--upload-pack=touch pwned", bun)).rejects.toBeInstanceOf(UpdateError);
   await expect(updateCheckout(clone, "main", bun)).rejects.toThrow(/not a git commit/);
+  await expect(updateCheckout(clone, "a".repeat(64), bun)).rejects.toThrow(
+    /SHA-256 name but .* uses SHA-1; it is not a clone/,
+  );
 });
 
 test("local changes in the client's checkout are not overwritten", async () => {
   const { clone, commits } = fresh(2);
   writeFileSync(join(clone, "code.txt"), "work in progress\n");
-  await expect(updateCheckout(clone, commits[1] as string, bun)).rejects.toThrow(/uncommitted changes/);
+  await expect(updateCheckout(clone, commits[1] as string, bun)).rejects.toThrow(
+    /has uncommitted changes; not checking out over them\. .* discard them with: git -C '.+' reset -q --hard, or re-run install\.sh$/,
+  );
   expect(readFileSync(join(clone, "code.txt"), "utf8")).toBe("work in progress\n");
 });
 
@@ -190,8 +198,16 @@ test("the update command an older installer wrote is ignored for the built-in on
   const { clone, commits } = fresh(2);
   const legacy = `git -C '${clone}' pull -q --ff-only && '${bun}' install --cwd '${clone}' --frozen-lockfile --production`;
   expect(LEGACY_UPDATE.test(legacy)).toBe(true);
+  // The unquoted form the example config used to show.
+  const example =
+    "git -C ~/.local/share/cnoc/app pull -q --ff-only && bun install --cwd ~/.local/share/cnoc/app --frozen-lockfile --production";
+  expect(LEGACY_UPDATE.test(example)).toBe(true);
+  // install.sh removes old commands with this very pattern rather than a copy of it.
+  expect(readFileSync(join(import.meta.dir, "..", "install.sh"), "utf8")).toContain(
+    'const { LEGACY_UPDATE } = require(app + "/src/client/update.ts");',
+  );
   const { u, lines } = updater(clone, specTempDir("cnoc-update-state-"), { t: 0 }, { command: legacy });
-  expect(lines[0]).toMatch(/written by an older install.sh and is ignored/);
+  expect(lines).toEqual([expect.stringMatching(/an older install.sh wrote it.*re-run install.sh, to silence this$/)]);
   expect(await u.attempt(commits[1] as string)).toBe(true);
   expect(head(clone)).toBe(commits[1] as string);
 });
@@ -212,4 +228,138 @@ test("a configured update command gets the target in its environment, never in i
   const failing = updater(dir, join(dir, "state"), { t: 0 }, { command: "echo nope >&2; exit 3" });
   expect(await failing.u.attempt("1.2.4")).toBe(false);
   expect(failing.lines).toEqual([expect.stringMatching(/the configured update command failed: nope/)]);
+});
+
+/** A stand-in for bun whose install fails in a checkout whose code.txt says "bad". */
+function fussyBun(): string {
+  const file = join(specTempDir("cnoc-fake-bun-"), "bun");
+  // Called as: bun install --cwd DIR ...
+  writeFileSync(
+    file,
+    '#!/bin/sh\ngrep -q bad "$3/code.txt" && { echo "error: lockfile had changes, but lockfile is frozen" >&2; exit 1; }\nexit 0\n',
+  );
+  chmodSync(file, 0o755);
+  return file;
+}
+
+test("when installing the new commit's dependencies fails, the checkout goes back", async () => {
+  const { origin, clone, commits } = fresh(1);
+  const before = commits[0] as string;
+  git(clone, "checkout", "-q", "-B", "main", before);
+  const broken = commit(origin, "code.txt", "bad\n");
+  await expect(updateCheckout(clone, broken, fussyBun())).rejects.toThrow(
+    /^bun install failed: error: lockfile had changes, but lockfile is frozen; went back to \w{7}$/,
+  );
+  // Back on the old code, on the branch it was on: a restart reports the old version and tries again.
+  expect(versionOf(clone)).toBe(before);
+  expect(git(clone, "symbolic-ref", "--short", "HEAD")).toBe("main");
+});
+
+test("a git that refuses a checkout owned by someone else still reports its commit", () => {
+  const { clone, commits } = fresh(1);
+  const saved = process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
+  process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = "1";
+  try {
+    // Plain git refuses it, which is what a service user running someone's clone would see.
+    expect(Bun.spawnSync(["git", "-C", clone, "rev-parse", "HEAD"], { env: process.env }).exitCode).not.toBe(0);
+    expect(versionOf(clone)).toBe(commits[0] as string);
+  } finally {
+    // biome-ignore lint/performance/noDelete: assigning undefined would leave the string "undefined" set
+    if (saved === undefined) delete process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
+    else process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = saved;
+  }
+});
+
+test("a version that strands clients says why", () => {
+  const { clone } = fresh(1);
+  expect(versionProblem(clone)).toBeNull();
+  writeFileSync(join(clone, "code.txt"), "edited\n");
+  expect(versionProblem(clone)).toMatch(
+    /has uncommitted changes, so the version is \w{7}-dirty\. No other host can update to it/,
+  );
+  expect(versionProblem(specTempDir("cnoc-plain-"))).toMatch(
+    new RegExp(
+      `^the version is the fallback ${VERSION.replace(/\./g, "\\.")} because .+ is not a git checkout\. Clients cannot update to it`,
+    ),
+  );
+  // A checkout whose git calls fail is named as such, with git's own words.
+  const broken = fresh(1).clone;
+  writeFileSync(join(broken, ".git", "HEAD"), "garbage\n");
+  expect(versionProblem(broken)).toMatch(/because git failed in .+: .+/);
+});
+
+test("when the record cannot be written the backoff is kept in memory", async () => {
+  const { clone } = fresh(1);
+  const unpushed = "0".repeat(40);
+  // A state directory that is not there stands in for a full or read-only disk.
+  const state = join(specTempDir("cnoc-update-state-"), "missing");
+  const clock = { t: 1_000_000 };
+  const { u, lines } = updater(clone, state, clock);
+  expect(await u.attempt(unpushed)).toBe(false);
+  expect(await u.attempt(unpushed)).toBe(false);
+  expect(lines).toEqual([
+    expect.stringMatching(/^cannot write .+update\.json .*keeping the update backoff in memory/),
+    expect.stringMatching(/^update to 0000000 failed: commit 0000000 is not on origin/),
+  ]);
+  expect(u.dueIn(unpushed)).toBe(UPDATE_RETRY_BASE_MS);
+  expect(() => u.clear()).not.toThrow();
+  expect(existsSync(state)).toBe(false);
+});
+
+test("the wait never exceeds the cap, even if the clock jumps back", async () => {
+  const { clone } = fresh(1);
+  const clock = { t: 1_000_000_000 };
+  const { u } = updater(clone, specTempDir("cnoc-update-state-"), clock);
+  expect(await u.attempt("0".repeat(40))).toBe(false);
+  clock.t -= 10 * 3_600_000;
+  expect(u.dueIn("0".repeat(40))).toBe(UPDATE_RETRY_MAX_MS);
+});
+
+test("a server flapping between versions cannot make a host restart more than the limit", async () => {
+  const { clone, commits } = fresh(3);
+  const state = specTempDir("cnoc-update-state-");
+  const clock = { t: 1_000_000 };
+  const targets = [commits[1], commits[2]] as [string, string];
+  let restarts = 0;
+  for (let i = 0; i < UPDATE_RESTART_LIMIT; i++) {
+    // Each restart is a new process on the code it just checked out.
+    const { u } = updater(clone, state, clock, { version: versionOf(clone) });
+    if (await u.attempt(targets[i % 2] as string)) restarts++;
+    clock.t += 15_000;
+  }
+  expect(restarts).toBe(UPDATE_RESTART_LIMIT);
+  const at = head(clone);
+  const { u, lines } = updater(clone, state, clock, { version: versionOf(clone) });
+  const next = targets[UPDATE_RESTART_LIMIT % 2] as string;
+  expect(await u.attempt(next)).toBe(false);
+  expect(head(clone)).toBe(at);
+  expect(lines).toEqual([
+    expect.stringMatching(
+      /^not updating to \w{7} yet: 5 restarts for updates in the last hour; is the server's version changing back and forth\? Next try in \d+m$/,
+    ),
+  ]);
+  // Agreeing with the server does not wipe the history the limit is counted from.
+  u.clear();
+  expect(u.state()?.restarts).toHaveLength(UPDATE_RESTART_LIMIT);
+});
+
+test("a configured command that leaves a git checkout short of the target is not trusted", async () => {
+  const { clone, commits } = fresh(2);
+  const { u, lines } = updater(clone, specTempDir("cnoc-update-state-"), { t: 0 }, { command: "true" });
+  expect(await u.attempt(commits[1] as string)).toBe(false);
+  expect(lines).toEqual([
+    expect.stringMatching(/the configured update command succeeded but left .+ at \w{7}; next try in 1m$/),
+  ]);
+});
+
+test("without git on PATH the fallback says that git could not be run", () => {
+  const { clone } = fresh(1);
+  const saved = process.env.PATH;
+  process.env.PATH = specTempDir("cnoc-empty-path-");
+  try {
+    expect(versionOf(clone)).toBe(VERSION);
+    expect(versionProblem(clone)).toMatch(/because git failed in .+: git could not be run: /);
+  } finally {
+    process.env.PATH = saved;
+  }
 });

@@ -2,12 +2,13 @@
  * End to end: a real server, real clients and real tmux sessions, using the shell harness.
  */
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
+import { type KeyObject, createPublicKey, generateKeyPairSync, sign } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { specTempDir } from "../scripts/testkit";
 import { type ClientConfig, CnocClient } from "../src/client/client";
 import { Tmux } from "../src/client/tmux";
-import type { ChangeEvent } from "../src/protocol";
+import { type ChangeEvent, PROTOCOL } from "../src/protocol";
 import { CnocServer, type HostInfo, type JobInfo } from "../src/server/server";
 import type { AttemptRow, TemplateRow } from "../src/server/store";
 import { versionOf } from "../src/version";
@@ -24,6 +25,8 @@ const root = specTempDir("cnoc-e2e-");
 const project = join(root, "proj");
 const socket = `cnoc-test-${process.pid}`;
 const quiet = () => {};
+/** Every test client's checkout unless it brings its own: not a git checkout, so a test that gets the versions wrong can never move this repository. */
+const noCheckout = join(root, "not-a-checkout");
 let server: CnocServer;
 let client: CnocClient;
 let seq = 0;
@@ -46,8 +49,7 @@ const newClient = (
     tmuxSocket: socket,
     pollMs: 100,
     log: quiet,
-    // Not a git checkout: a test that gets the versions wrong must never move this repository.
-    checkout: join(root, "not-a-checkout"),
+    checkout: noCheckout,
     ...extra,
   });
 
@@ -269,6 +271,7 @@ test("work finished while the server was down is reported when it returns", asyn
     tmuxSocket: socket,
     pollMs: 100,
     log: quiet,
+    checkout: noCheckout,
   }).start();
   try {
     const j = id("outlives-server");
@@ -311,6 +314,7 @@ test("an unknown host waits for approval", async () => {
     stateDir: join(root, "state-gamma"),
     tmuxSocket: socket,
     log: quiet,
+    checkout: noCheckout,
   }).start();
   try {
     const hosts = async () => (await api("GET", "/v1/hosts", undefined, strict)).hosts;
@@ -438,6 +442,40 @@ test("a client that cannot reach the server's commit says why and does not resta
   } finally {
     await eta.stop();
     await srv.stop();
+  }
+});
+
+/** One hand-made hello, as any key holder could send it. Resolves when the server closes the connection. */
+async function rawHello(srv: CnocServer, name: string, key: KeyObject, fields: { version: string; update: string }) {
+  const ws = new WebSocket(`${srv.url.replace(/^http/, "ws")}/v1/client`);
+  const closed = new Promise<void>((resolve) => {
+    ws.onclose = () => resolve();
+  });
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(String(ev.data)) as { t: string; nonce?: string };
+    if (msg.t !== "challenge") return;
+    const pubkey = createPublicKey(key).export({ type: "spki", format: "der" }).toString("base64");
+    const sig = sign(null, Buffer.from(`cnoc-hello\n${name}\n${msg.nonce}`), key).toString("base64");
+    ws.send(JSON.stringify({ t: "hello", name, pubkey, sig, protocol: PROTOCOL, ...fields }));
+  };
+  await closed;
+}
+
+test("what a host on another version says is shown only for an approved key, and only as plain text", async () => {
+  const strict = await new CnocServer({ dataDir: join(root, "data-notes"), port: 0, log: quiet }).start();
+  try {
+    const { privateKey } = generateKeyPairSync("ed25519");
+    const forged = { version: "\u001b[2Jevil", update: "\u001b[31mfine\nmallory online all good\u0007" };
+    await rawHello(strict, "theta", privateKey, forged);
+    const pending = (await api("GET", "/v1/hosts", undefined, strict)).hosts.find((h) => h.name === "theta");
+    expect(pending).toMatchObject({ status: "pending", mismatch: null });
+
+    await api("POST", "/v1/host/approve?name=theta", undefined, strict);
+    await rawHello(strict, "theta", privateKey, forged);
+    const shown = (await api("GET", "/v1/hosts", undefined, strict)).hosts.find((h) => h.name === "theta");
+    expect(shown?.mismatch).toMatchObject({ version: "(invalid)", note: " [31mfine mallory online all good " });
+  } finally {
+    await strict.stop();
   }
 });
 
@@ -574,6 +612,7 @@ test("a custom placement policy is loaded from a file", async () => {
     tmuxSocket: socket,
     pollMs: 100,
     log: quiet,
+    checkout: noCheckout,
   }).start();
   try {
     const [ok, banned] = [id("allowed"), id("banned")];

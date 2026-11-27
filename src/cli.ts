@@ -7,7 +7,7 @@ import { JobfileError, checkTemplate, declaresArgs, parseJob } from "./jobfile";
 import { type ChangeEvent, type Overrides, PROTOCOL } from "./protocol";
 import { CnocServer, type HostInfo, type JobInfo, type ServerOptions } from "./server/server";
 import type { AttemptRow, TemplateRow } from "./server/store";
-import { runningVersion, shortVersion } from "./version";
+import { printable, runningVersion, shortVersion } from "./version";
 
 const HELP = `cnoc - batch scheduling of agent harness sessions across persistent hosts
 
@@ -446,7 +446,9 @@ async function main(): Promise<void> {
       for (const h of r.hosts) {
         const m = h.online ? null : h.mismatch;
         if (m)
-          behind.push(`${h.name} runs ${shortVersion(m.version)}, ${age(m.at)} ago: ${m.note ?? "no update reported"}`);
+          behind.push(
+            `${h.name} runs ${shortVersion(m.version)}, ${age(m.at)} ago: ${printable(m.note ?? "no update reported")}`,
+          );
         const status =
           h.status === "pending" ? "pending" : m ? "outdated" : h.drained ? "drained" : h.online ? "online" : "offline";
         const res = Object.keys(h.capacity)

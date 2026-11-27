@@ -184,6 +184,10 @@ Update the server and the clients follow. On the server: `git pull`, then restar
 - The server must run a commit that is pushed to the repository the clients cloned. A server with uncommitted changes reports `COMMIT-dirty`, which no client can reach.
 - A client that cannot update (commit not pushed, network down, local changes in its clone) logs one line saying why and tries again after 1, 2, 4… minutes, at most every 30 minutes. A new server version is tried at once.
 - `cnoc hosts` shows the server's version and each host's, and for a host that has not caught up, what it last said about its update. `cnoc version` prints both versions.
+- At most 5 updates an hour end in a restart, so a server whose version changes back and forth cannot make hosts thrash.
+- A server or client whose version is the fallback (git could not say which commit it runs) or ends in `-dirty` logs a `WARNING` line at start. Either one strands the other hosts.
+- `--ref` only chooses what the installer checks out first. From the first connection on, the client runs whatever commit the server runs.
+- **Hosts installed before this.** Their old code updates with `git pull` of the branch they were installed from. On `main` that reaches the new code without help. A host installed with `--ref` on another branch, or whose pull fails, restarts every few seconds without catching up: run the installer on it once.
 - Not a git checkout? Set `"update"` in the client config to a shell command; it runs with `CNOC_TARGET_VERSION` set. `CNOC_VERSION` overrides the version of either side.
 
 **Each host:** run the [installer](#install-a-client). The client generates a key on first start and waits to be approved. The config it writes looks like [examples/client.json](examples/client.json).

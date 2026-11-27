@@ -18,7 +18,7 @@ import type {
   StageResult,
 } from "../protocol";
 import { PROTOCOL, TERMINAL, impliedFeatures } from "../protocol";
-import { runningVersion } from "../version";
+import { SAFE_VERSION, printable, runningVersion, runningVersionProblem } from "../version";
 import { type HostView, type Policy, type QueuedJob, defaultPolicy, schedule } from "./scheduler";
 import { type AttemptRow, type HostRow, Store, SubmitError } from "./store";
 
@@ -118,6 +118,9 @@ export class CnocServer {
     this.store = new Store(join(opts.dataDir, "cnoc.sqlite"));
     this.version = opts.version ?? runningVersion();
     this.log = opts.log ?? ((l) => console.log(`[server] ${l}`));
+    // Either one strands every client: say so where whoever started the server will look.
+    const problem = opts.version === undefined ? runningVersionProblem() : null;
+    if (problem) this.log(`WARNING: ${problem}`);
     const tokenFile = join(opts.dataDir, "admin.token");
     if (!existsSync(tokenFile)) writeFileSync(tokenFile, `${randomBytes(24).toString("base64url")}\n`, { mode: 0o600 });
     this.adminToken = readFileSync(tokenFile, "utf8").trim();
@@ -344,16 +347,18 @@ export class CnocServer {
       return;
     }
     if (!host) host = this.store.enroll(msg.name, msg.pubkey, this.opts.openEnrollment === true);
-    if (msg.version !== this.version) {
-      // Signed by the key the name is bound to, so the note is the host's own.
-      const note = typeof msg.update === "string" ? msg.update.slice(0, 500) : null;
-      this.mismatched.set(msg.name, { version: String(msg.version).slice(0, 100), note, at: Date.now() });
-      ws.close(1008, "version mismatch");
-      return;
-    }
     if (host.status !== "approved") {
+      this.mismatched.delete(msg.name);
       this.send(ws, { t: "pending", fingerprint: fingerprint(msg.pubkey) });
       ws.close(1008, "pending approval");
+      return;
+    }
+    if (msg.version !== this.version) {
+      // Signed by the approved key the name is bound to, so the note is the host's own; it is still made safe to print.
+      const version = typeof msg.version === "string" && SAFE_VERSION.test(msg.version) ? msg.version : "(invalid)";
+      const note = typeof msg.update === "string" ? printable(msg.update, 300) : null;
+      this.mismatched.set(msg.name, { version, note, at: Date.now() });
+      ws.close(1008, "version mismatch");
       return;
     }
     this.mismatched.delete(msg.name);
