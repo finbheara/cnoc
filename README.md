@@ -129,6 +129,30 @@ cnoc template rm disk-cleanup.job                                # by number, na
 - Adding a template whose id already exists replaces its content and keeps its number.
 - `cnoc t` is short for `cnoc template`. [examples/disk-cleanup.job](examples/disk-cleanup.job) is a complete one.
 
+### Keyed runs
+
+A run can have a key, so offering the same work twice starts it once. `--key` names the job `<template id>/<key>`; the key may contain `/`. A template can also declare its own key in front matter, filled from its arguments, so every run of it is keyed even when started by hand. `--key` overrides it.
+
+```
+---
+id: lane
+key: ${PROJECT}/${ISSUE}
+---
+ARG PROJECT
+ARG ISSUE
+...
+```
+
+```
+cnoc template run lane --set PROJECT=myapp --set ISSUE=1234   # submits lane/myapp/1234
+cnoc template run lane --set PROJECT=myapp --set ISSUE=1234   # exists     lane/myapp/1234  running  (already run with this key)
+cnoc template run lane --key hotfix --set PROJECT=myapp --set ISSUE=1   # submits lane/hotfix
+```
+
+- A second run with the same key does nothing and says so, whatever state the job is in and whatever has changed in the arguments or the template since. A failed run is started again with `cnoc requeue`, not by running the template again.
+- A key may not be all digits, since those are the numbers of unkeyed runs; `issue-4` and `myapp/4` are fine. A job by that id that the template did not start is refused, not taken for the run.
+- A run without a key is numbered as before.
+
 ## Reporting a result
 
 Every session gets a `cnoc` command on its `PATH`:

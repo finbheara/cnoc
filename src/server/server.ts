@@ -548,12 +548,25 @@ export class CnocServer {
             seq: this.store.seq(),
           });
         case "POST /v1/template/run": {
-          const b = (await req.json().catch(() => ({}))) as { set?: Record<string, string>; overrides?: Overrides };
+          const b = (await req.json().catch(() => ({}))) as {
+            set?: Record<string, string>;
+            overrides?: Overrides;
+            key?: string | null;
+            keyed?: boolean | null;
+          };
           const set = b.set ?? {};
           if (typeof set !== "object" || Object.values(set).some((v) => typeof v !== "string"))
             throw new SubmitError("expected { set: { NAME: value } }");
-          const r = this.store.templateRun(q.get("ref") ?? "", set, b.overrides ?? {}, who.actor);
-          return J({ job: this.jobView(r.job), template: { ...r.template, body: undefined }, seq: this.store.seq() });
+          const key = b.key ?? undefined; // null is the same as absent
+          if (key !== undefined && typeof key !== "string") throw new SubmitError("key must be a string");
+          if (b.keyed != null && typeof b.keyed !== "boolean") throw new SubmitError("keyed must be a boolean");
+          const r = this.store.templateRun(q.get("ref") ?? "", set, b.overrides ?? {}, who.actor, {
+            key,
+            keyed: b.keyed ?? undefined,
+          });
+          const job = this.jobView(r.job);
+          const template = { ...r.template, body: undefined };
+          return J({ job, template, created: r.created, state: job?.state, seq: this.store.seq() });
         }
         case "POST /v1/job/abandon": {
           // Gives up on a running attempt whose host is unreachable. The session may still

@@ -64,6 +64,9 @@ interface Res {
   events: ChangeEvent[];
   templates: TemplateRow[];
   template: TemplateRow;
+  /** `POST /v1/template/run`: false when a keyed run's job already existed. */
+  created: boolean;
+  state: string;
   result: string;
   subscription: { id: number; secret: string };
 }
@@ -557,6 +560,66 @@ test("a template runs again and again, with arguments, pinned to a host", async 
   } finally {
     await pin.stop();
   }
+});
+
+test("a keyed template run happens once, however often it is offered", async () => {
+  const name = `keyed-${++seq}`;
+  const text = `---\nid: ${name}\nkey: issue-\${ISSUE}\n---\nARG ISSUE\nARG CMD=true\nFROM proj\nHARNESS shell\nPROMPT "\${CMD}"\n`;
+  expect((await api("POST", "/v1/templates", { text })).status).toBe(200);
+  const runOf = (body: unknown) => api("POST", `/v1/template/run?ref=${name}`, body);
+
+  // The template's own key names the run; it fails, and offering it again does not start it again.
+  const first = await runOf({ set: { ISSUE: "7", CMD: "false" }, keyed: true });
+  expect(first).toMatchObject({ status: 200, created: true, job: { id: `${name}/issue-7` } });
+  expect(first.state).toBe(first.job.state);
+  await reaches(`${name}/issue-7`, "failed");
+  const again = {
+    status: 200,
+    created: false,
+    state: "failed",
+    job: { id: `${name}/issue-7`, state: "failed" },
+  };
+  // Other arguments, and then a template that now needs an argument this caller does not send.
+  expect(await runOf({ set: { ISSUE: "7", CMD: "echo other" }, keyed: true })).toMatchObject(again);
+  const changed = text.replace("ARG CMD=true\n", "ARG CMD=true\nARG NEW\n");
+  expect((await api("POST", "/v1/templates", { text: changed })).result).toBe("updated");
+  expect(await runOf({ set: { ISSUE: "7", CMD: "false" }, keyed: true, key: null })).toMatchObject(again);
+  expect((await runOf({ set: { ISSUE: "70" } })).error).toMatch(/NEW has no default/);
+  expect((await api("POST", "/v1/templates", { text })).result).toBe("updated");
+
+  // A key given with the run overrides the template's, and may contain a slash.
+  const own = await runOf({ set: { ISSUE: "8" }, key: "myapp/8" });
+  expect(own).toMatchObject({ created: true, job: { id: `${name}/myapp/8` } });
+  await reaches(`${name}/myapp/8`, "done");
+  expect(await runOf({ set: { ISSUE: "9" }, key: "myapp/8" })).toMatchObject({ created: false, state: "done" });
+  expect((await runOf({ set: { ISSUE: "1" }, key: "a b" })).error).toMatch(/not a valid id segment/);
+  expect((await runOf({ set: { ISSUE: "1" }, key: 5 })).error).toMatch(/key must be a string/);
+  expect((await runOf({ set: { ISSUE: "1" }, key: "8" })).error).toMatch(/all digits/);
+  // A job this template did not start is not passed off as a run of it.
+  await submit(job(`${name}/plain`, "true"));
+  const taken = await runOf({ set: { ISSUE: "1" }, key: "plain" });
+  expect(taken).toMatchObject({
+    status: 409,
+    error: `job ${name}/plain exists and was not started by template ${name}`,
+  });
+  await reaches(`${name}/plain`, "done");
+
+  const runs = (await events()).flatMap((e) =>
+    e.type === "template.run" && (e.data as { name: string }).name === name ? [e.job] : [],
+  );
+  expect(runs).toEqual([`${name}/issue-7`, `${name}/myapp/8`]);
+  expect((await api("GET", `/v1/template?ref=${name}`)).template.runs).toBe(2);
+
+  // A template without a key: keyed refuses the run, and no job is made.
+  const loose = `loose-${++seq}`;
+  await api("POST", "/v1/templates", { text: `---\nid: ${loose}\n---\nFROM proj\nHARNESS shell\nPROMPT true\n` });
+  const refused = await api("POST", `/v1/template/run?ref=${loose}`, { keyed: true });
+  expect(refused.status).toBe(400);
+  expect(refused.error).toMatch(/this run has no key/);
+  expect((await api("GET", "/v1/jobs?all=1")).jobs.some((j) => j.id.startsWith(`${loose}/`))).toBe(false);
+  const numbered = await api("POST", `/v1/template/run?ref=${loose}`, {});
+  expect(numbered).toMatchObject({ created: true, job: { id: `${loose}/1` } });
+  await reaches(`${loose}/1`, "done");
 });
 
 test("a job with a begin time waits for it", async () => {

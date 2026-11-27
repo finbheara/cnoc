@@ -33,7 +33,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Glob } from "bun";
 
-import { checkTemplate, declaresArgs, parseJob } from "../src/jobfile";
+import { checkTemplate, isTemplate, parseJob } from "../src/jobfile";
 import { detectContext, isCi, isPreCommit, isPrePush } from "./_runner/context";
 import { createAiFileLogger, createConsoleLogger } from "./_runner/logger";
 import { killTrackedTree } from "./_runner/process-tree";
@@ -98,7 +98,7 @@ export const jobfilesStep: ScriptFunction = async ({ logger }) => {
   for (const rel of files) {
     const text = readFileSync(resolve(REPO_ROOT, rel), "utf8");
     try {
-      if (declaresArgs(text)) checkTemplate(text);
+      if (isTemplate(text)) checkTemplate(text);
       else parseJob(text);
     } catch (e) {
       bad++;

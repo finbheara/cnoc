@@ -60,6 +60,7 @@ A Jobfile is YAML front matter followed by one instruction per line, in the Dock
 | `time` | no | Wall-clock limit for the whole job (`90s`, `30m`, `4h`, `1d2h`). |
 | `begin` | no | The job may not start before this. A time with a zone (`2027-01-31T03:00:00Z`), or `+duration` counted from submission. A time without a zone is an error. |
 | `labels` | no | Free-form map. Ignored by Cnoc. |
+| `key` | no | Templates only (3.5): names each run `<id>/<key>`, so a run with the same key is started once. An error in a plain Jobfile. |
 
 An unknown key is an error.
 
@@ -96,10 +97,13 @@ A template is a Jobfile stored on the server so it can be started repeatedly.
 
 - `ARG NAME` or `ARG NAME=default` declares an argument; names are capitals, digits and underscores. `ARG` is an error in a plain job.
 - Starting a template replaces `${NAME}` for every declared argument throughout the text, front matter included, and removes the `ARG` lines. Undeclared names are left alone. An argument with no default must be supplied; an unknown argument is an error.
-- The template's `id` is its name and may not contain an argument. Each run is submitted as the job `<name>/<n>`. The counter belongs to the name and survives removal of the template, so job ids are never reused.
+- The template's `id` is its name and may not contain an argument. Each run is submitted as the job `<name>/<n>`. The counter belongs to the name and survives removal of the template, so job ids are never reused, and it skips any id that already exists.
+- A run may have a key. It comes from the run request, or else from the template's `key:` front matter line, which is filled from the arguments like the rest of the text (`key: ${PROJECT}-${ISSUE}`). A keyed run is the job `<name>/<key>`. The key may contain `/` and must match `[A-Za-z0-9._#-]+(/[A-Za-z0-9._#-]+)*`, and the whole id must be a valid id. A segment may not be `.` or `..`, and the key may not be all digits: those ids are the numbered runs, so a keyed run and a numbered one never share an id. The line is read as the template writes it, before arguments are filled in: a bare value is taken literally, not as a YAML number (`0x7` stays `0x7`), up to a ` #` comment as YAML would; a quoted value is read as a YAML string. A `#` or a quote in an argument's value is part of the key, and is refused as not a valid id segment. A key given with the run replaces the declared one entirely; the declared one is not read. `key` is an error in a plain Jobfile, and the `key:` line is removed from the job a run creates.
+- A keyed run whose job already exists is a no-op, in any state of that job and whatever the arguments or the template now say: no job, no event, no count. To make that hold for a declared key, only the `key:` line is filled (from the arguments given and the defaults) to find the job; the rest of the template is filled only for a new run. A failed or cancelled run is run again with requeue. This makes a run safe to offer repeatedly, like a submission (3.3).
+- A job by that id that the template did not start (a plain submission, or a run of another template whose name makes the same id) is not taken for the run: the request is refused with 409.
 - A run is an ordinary job: its text is the filled-in template and does not change if the template does. It carries the label `template: <name>`.
 - Adding a template whose name exists replaces its text and keeps its number. A template is found by number, by name, or by the path of the file it was added from.
-- A template is validated when added, with `1` standing in for arguments that have no default.
+- A template is validated when added, with `1` standing in for arguments that have no default. That includes its key.
 
 ## 4. Adapters
 
@@ -251,7 +255,7 @@ Bearer token on every call except health. The admin token may do everything. A h
 | `POST /v1/templates` | Admin. Add or replace: `{ "text", "source"? }`. |
 | `GET /v1/template?ref=` | One template with its text. `ref` is a number, a name or a source path. |
 | `DELETE /v1/template?ref=` | Admin. Remove. Jobs it started are unaffected. |
-| `POST /v1/template/run?ref=` | Start a job: `{ "set"?: { NAME: value }, "overrides"? }`. |
+| `POST /v1/template/run?ref=` | Start a job: `{ "set"?: { NAME: value }, "overrides"?, "key"?: string, "keyed"?: boolean }`. A `key` of null is the same as none. `keyed: true` refuses (400) a run that has no key from the request or the template; a key whose id belongs to a job the template did not start is refused with 409. Answers `{ job, template, created, state, seq }`; `created` is false when a keyed run's job already existed, and `state` is the job's state. |
 | `GET /v1/hosts` | Hosts with capacity, reserved counts, load and running attempts. |
 | `POST /v1/host/approve?name=` | Admin. Approve a pending key. |
 | `POST /v1/host/drain?name=&on=1\|0` | Admin. Stop or resume placing work on a host. |
@@ -276,7 +280,7 @@ Each event is `{ seq, ts, type, job, attempt, host, actor, data }`. `seq` increa
 | `job.requeued` | A terminal job was sent round again. |
 | `job.priority` | A waiting job's priority was changed. |
 | `template.added`, `.updated`, `.removed` | A template changed. |
-| `template.run` | A template started a job; the event names the job and the arguments. |
+| `template.run` | A template started a job; the event names the job, the arguments and the key, if any. A keyed run that changed nothing has no event. |
 | `job.terminal` | The job is `done`, `failed` or `cancelled`. |
 | `attempt.assigned`, `.returned`, `.started`, `.progress`, `.ended` | The life of one attempt. |
 | `attempt.late_report` | A result arrived for an attempt that was no longer open. It is not applied. |
