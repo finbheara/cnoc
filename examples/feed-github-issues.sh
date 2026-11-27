@@ -11,7 +11,8 @@
 #   FEED_LIMIT  most issues listed, default 200
 #
 # Each line sets PROJECT and ISSUE and is keyed PROJECT-ISSUE, so an issue becomes one job however
-# many times it is listed:
+# many times it is listed. The key is never the bare issue number: cnoc refuses an all-digit key,
+# because <template>/<n> is the name of an unkeyed, numbered run.
 #
 #   {"template":"lane","key":"myapp-1234","set":{"PROJECT":"myapp","ISSUE":"1234"}}
 #

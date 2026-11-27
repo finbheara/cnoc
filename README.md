@@ -302,7 +302,8 @@ cnoc feed --every 5m -- examples/feed-github-issues.sh example-org/myapp ready-f
 cnoc feed --dry-run -- examples/feed-github-issues.sh example-org/myapp ready-for-agent lane
 ```
 
-- `template` is required. `key` may be left out when the template declares its own key; a line with neither is rejected, so a pass can never create a fresh job each time. `set`, `priority`, `on` and `begin` are as for `cnoc template run`.
+- `template` is required. `key` may be left out when the template declares its own key; a line with neither is rejected, so a pass can never create a fresh job each time. `set`, `priority`, `on` and `begin` are as for `cnoc template run`, and a field set to `null` counts as left out.
+- A key may not be all digits, because `<template>/<n>` is the name of an unkeyed, numbered run. That is why the example keys an issue as `myapp-1234`, not `1234`.
 - Without `--every` it makes one pass and exits, non-zero if the command failed or any line was rejected, which suits cron or a systemd timer. With `--every` it repeats, one pass at a time, and logs failures and carries on.
 - `--max N` (default 10) caps the new jobs a pass may create, so a source that suddenly lists a thousand items starts ten. The rest are created on later passes.
 - The command runs without a shell (use `sh -c '...'` if you need one) and has two minutes. If it fails or times out, nothing from that pass is submitted, even lines it printed. A bad line is reported with its line number and the other lines still go.

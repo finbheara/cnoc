@@ -351,7 +351,7 @@ Specified but not built:
 `cnoc feed [--every DURATION] [--max N] [--dry-run] -- COMMAND [ARGS...]` is a client of the HTTP API. The server knows nothing about it.
 
 - COMMAND is executed directly, without a shell, with a two-minute limit. On expiry its whole process group is sent SIGTERM, then SIGKILL after a grace period.
-- Its standard output is JSON lines, one template run each: `{ "template", "key"?, "set"?, "priority"?, "on"?, "begin"? }`. `template` is a name or a number; `set` maps names to strings or numbers; the last three are the overrides of §3.4. Blank lines are skipped. A line that is not a JSON object, or has an unknown or ill-typed field, is reported with its line number and skipped.
+- Its standard output is JSON lines, one template run each: `{ "template", "key"?, "set"?, "priority"?, "on"?, "begin"? }`. `template` is a name or a number; `set` maps names to strings or numbers; the last three are the overrides of §3.4. A null field is the same as an absent one. The key rules are those of §3.5; the server checks them. Blank lines are skipped. A line that is not a JSON object, or has an unknown or ill-typed field, is reported with its line number and skipped.
 - Each valid line is sent to `POST /v1/template/run` with `keyed: true`, so the server refuses a run for which neither the line nor the template gives a key. A key that exists answers `created: false` and creates nothing. Offering the whole backlog every pass is therefore safe, and the feeder holds no state.
 - A command that exits non-zero, is killed or times out submits nothing from that pass.
 - `--max N`, default 10, stops a pass after N new jobs. Lines after that are not sent; they are offered again next pass.

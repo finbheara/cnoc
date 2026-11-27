@@ -30,6 +30,7 @@ Runs COMMAND (directly, no shell) and submits each line it prints as a keyed tem
   {"template":"lane","key":"myapp-1234","set":{"PROJECT":"myapp","ISSUE":"1234"},"priority":5,"on":"workbox","begin":"+2h"}
 "template" (a name or number) is required. "key" is needed unless the template declares one.
 "set" values are strings or numbers. "priority", "on" and "begin" are as for cnoc template run.
+A null field is the same as one left out. A key may not be all digits: use myapp-1234, not 1234.
 A run whose key already exists is left alone, so the whole backlog can be offered every pass.
 
   --every DURATION   repeat forever, one pass at a time (90s, 5m, 1h); without it, one pass then exit,
@@ -152,7 +153,10 @@ export function parseFeedLine(text: string, line: number): FeedLine | string | n
   }
   if (!isPlain(v)) return "not a JSON object";
   for (const k of Object.keys(v)) if (!LINE_FIELDS.has(k)) return `unknown field ${JSON.stringify(k)}`;
-  const { template, key, set, priority, on, begin } = v;
+  // null is the same as absent, as it is for the server.
+  const opt = (k: string): unknown => v[k] ?? undefined;
+  const { template } = v;
+  const [key, set, priority, on, begin] = ["key", "set", "priority", "on", "begin"].map(opt);
   let ref: string;
   if (typeof template === "string" && template.trim() !== "") ref = template;
   else if (typeof template === "number" && Number.isInteger(template) && template > 0) ref = String(template);

@@ -80,6 +80,11 @@ test("a line is a template run with optional key, arguments and scheduling", () 
     ref: "4",
     body: { set: {}, overrides: {}, keyed: true },
   });
+  expect(parseFeedLine(line({ template: "lane", key: null, set: null, priority: null }), 2)).toEqual({
+    line: 2,
+    ref: "lane",
+    body: { set: {}, overrides: {}, keyed: true },
+  });
   expect(parseFeedLine("   ", 2)).toBeNull();
 });
 
