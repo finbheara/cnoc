@@ -186,6 +186,8 @@ export function parseJob(text: string, now = Date.now()): JobSpec {
     throw new JobfileError(`front matter is not valid YAML: ${(e as Error).message}`);
   }
   if (typeof fm !== "object" || Array.isArray(fm)) throw new JobfileError("front matter must be a map");
+  if ("key" in fm)
+    throw new JobfileError("key belongs in a template, where it names each run; a plain Jobfile is named by its id");
   for (const k of Object.keys(fm)) if (!FRONT_KEYS.has(k)) throw new JobfileError(`unknown front matter key: ${k}`);
 
   const id = fm.id;
@@ -282,12 +284,18 @@ function argLines(text: string): Array<TemplateArg & { line: number }> {
   return out;
 }
 
+/** A template with its arguments filled in, and the key its front matter declares, if any. */
+export interface Filled {
+  /** A plain Jobfile: the ARG lines and the `key:` line are blanked. Its id is still the template's name. */
+  text: string;
+  key: string | null;
+}
+
 /**
- * Turns a template into a Jobfile: fills every `${NAME}` that an ARG line declares, drops
- * the ARG lines and, if asked, replaces the id. Names that are not declared are left alone,
- * so shell variables in a prompt pass through.
+ * Fills every `${NAME}` that an ARG line declares and drops the ARG lines and the `key:` line.
+ * Names that are not declared are left alone, so shell variables in a prompt pass through.
  */
-export function instantiate(text: string, set: Record<string, string>, id?: string): string {
+export function fill(text: string, set: Record<string, string>): Filled {
   const args = argLines(text);
   for (const k of Object.keys(set)) {
     if (!args.some((a) => a.name === k))
@@ -307,19 +315,76 @@ export function instantiate(text: string, set: Record<string, string>, id?: stri
     if ((lines[a.line - 1] ?? "").endsWith("\\")) throw new JobfileError("ARG must fit on one line", a.line);
     lines[a.line - 1] = ""; // blanked, not removed, so later errors keep their line numbers
   }
-  if (id !== undefined) {
-    const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
-    const at = lines.findIndex((l, i) => i > 0 && i < end && /^id\s*:/.test(l));
-    if (lines[0]?.trim() !== "---" || at < 0)
-      throw new JobfileError("a template needs front matter with its own `id:` line");
-    lines[at] = `id: ${id}`;
+  const at = frontLine(lines, "key");
+  const filled = lines.map((l) =>
+    l.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => values.get(name) ?? whole),
+  );
+  let key: string | null = null;
+  if (at >= 0) {
+    key = keyValue((filled[at] as string).replace(/^key\s*:/, "").trim(), at + 1);
+    filled[at] = "";
   }
-  return lines.join("\n").replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => values.get(name) ?? whole);
+  return { text: filled.join("\n"), key };
+}
+
+/** The index of a top-level front matter line `name: ...`, or -1. */
+function frontLine(lines: string[], name: string): number {
+  if (lines[0]?.trim() !== "---") return -1;
+  const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
+  const re = new RegExp(`^${name}\\s*:`);
+  return lines.findIndex((l, i) => i > 0 && i < end && re.test(l));
+}
+
+/** A key as written: bare text taken literally (so `007` stays `007`), or a quoted YAML string. */
+function keyValue(raw: string, line: number): string {
+  let v = raw;
+  if (/^["']/.test(raw)) {
+    try {
+      v = YAML.parse(raw) as string;
+    } catch {
+      throw new JobfileError(`key is not a valid string: ${raw}`, line);
+    }
+    if (typeof v !== "string") throw new JobfileError(`key is not a valid string: ${raw}`, line);
+  }
+  if (v === "") throw new JobfileError("key is empty", line);
+  return v;
+}
+
+const KEY_RE = /^[A-Za-z0-9._#-]+(\/[A-Za-z0-9._#-]+)*$/;
+
+/** The id of a keyed run: `<name>/<key>`. The key may contain `/`; the whole must be a valid job id. */
+export function keyedId(name: string, key: string): string {
+  const id = `${name}/${key}`;
+  if (!KEY_RE.test(key) || !ID_RE.test(id) || id.length > 200)
+    throw new JobfileError(
+      `key ${JSON.stringify(key)} is not a valid id segment: it must match ${KEY_RE.source} and make an id of at most 200 characters`,
+    );
+  return id;
+}
+
+/** Replaces the id in a Jobfile's front matter. */
+export function withId(text: string, id: string): string {
+  const lines = text.split(/\r?\n/);
+  const at = frontLine(lines, "id");
+  if (at < 0) throw new JobfileError("a template needs front matter with its own `id:` line");
+  lines[at] = `id: ${id}`;
+  return lines.join("\n");
+}
+
+/** Turns a template into a Jobfile: fills its arguments and, if asked, replaces the id. */
+export function instantiate(text: string, set: Record<string, string>, id?: string): string {
+  const { text: out } = fill(text, set);
+  return id === undefined ? out : withId(out, id);
 }
 
 /** True when the text declares arguments, which makes it a template and not a job that can be submitted as it is. */
 export function declaresArgs(text: string): boolean {
   return /^\s*ARG\s/im.test(text);
+}
+
+/** True for a template: it declares arguments or a run key. */
+export function isTemplate(text: string): boolean {
+  return declaresArgs(text) || frontLine(text.split(/\r?\n/), "key") >= 0;
 }
 
 /** Validates a template as far as it can be without real arguments. Its id is its name. */
@@ -330,7 +395,10 @@ export function checkTemplate(text: string): { name: string; args: TemplateArg[]
     throw new JobfileError("a template's id is its name and cannot contain an argument");
   // Arguments without a default are tried as "1", which is a valid name, count and duration.
   const trial = Object.fromEntries(args.filter((a) => a.default === null).map((a) => [a.name, "1"]));
-  return { name: parseJob(instantiate(text, trial)).id, args };
+  const filled = fill(text, trial);
+  const name = parseJob(filled.text).id;
+  if (filled.key !== null) keyedId(name, filled.key);
+  return { name, args };
 }
 
 function terminalStep(verb: string, rest: string, line: number): Step {

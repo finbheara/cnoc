@@ -3,7 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CnocClient, loadClientConfig } from "./client/client";
-import { JobfileError, checkTemplate, declaresArgs, parseJob } from "./jobfile";
+import { JobfileError, checkTemplate, isTemplate, parseJob } from "./jobfile";
 import { type ChangeEvent, type Overrides, PROTOCOL, VERSION } from "./protocol";
 import { CnocServer, type HostInfo, type JobInfo, type ServerOptions } from "./server/server";
 import type { AttemptRow, TemplateRow } from "./server/store";
@@ -27,7 +27,7 @@ Templates (cnoc t is short for cnoc template)
   cnoc template add FILE...                save a Jobfile so it can be started again and again
   cnoc template list
   cnoc template show REF
-  cnoc template run REF [--set NAME=VALUE]... [WHEN AND WHERE]
+  cnoc template run REF [--set NAME=VALUE]... [--key KEY] [WHEN AND WHERE]
   cnoc template rm REF                     REF is the number, the name, or the file it was added from
 
 When and where, for submit and template run
@@ -253,7 +253,7 @@ async function main(): Promise<void> {
       for (const f of pos) {
         try {
           const text = readFileSync(f, "utf8");
-          if (declaresArgs(text)) {
+          if (isTemplate(text)) {
             const t = checkTemplate(text);
             const args = t.args.map((a) => (a.default === null ? a.name : `${a.name}=${a.default}`)).join(", ");
             console.log(`ok    ${f}  (template ${t.name}; arguments: ${args})`);
@@ -336,7 +336,14 @@ async function main(): Promise<void> {
             if (i < 1) throw new CliError(`--set takes NAME=VALUE, got ${kv}`);
             set[kv.slice(0, i)] = kv.slice(i + 1);
           }
-          const r = await api<OneJob>("POST", `/v1/template/run?${ref()}`, { set, overrides: overrides(flags) });
+          if (flags.key === true) throw new CliError("--key takes a value");
+          const key = typeof flags.key === "string" ? flags.key : undefined;
+          const r = await api<OneJob & { created: boolean }>("POST", `/v1/template/run?${ref()}`, {
+            set,
+            overrides: overrides(flags),
+            ...(key !== undefined ? { key } : {}),
+          });
+          if (!r.created) return console.log(`exists     ${r.job.id}  ${r.job.state}  (already run with this key)`);
           return console.log(`submitted  ${r.job.id}  ${r.job.state}${why(r.job) ? `  (${why(r.job)})` : ""}`);
         }
         case "rm":

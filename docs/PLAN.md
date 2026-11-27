@@ -4,7 +4,7 @@ What exists, what does not, and the order to build the rest. The design is in [S
 
 ## Built and tested
 
-Tested means covered by `bun test`: 78 tests of cnoc itself, 25 of them end to end with a real server, real clients and real tmux sessions, and 274 specs of the gate.
+Tested means covered by `bun test`: 86 tests of cnoc itself, 26 of them end to end with a real server, real clients and real tmux sessions, and 274 specs of the gate.
 
 | Area | What works |
 |---|---|
@@ -17,7 +17,7 @@ Tested means covered by `bun test`: 78 tests of cnoc itself, 25 of them end to e
 | Changelog | Numbered events, paging and long-poll, server-sent events, signed in-order webhooks, `/v1/state` snapshot. |
 | Updates | A client on the wrong version takes no work, runs its update command and exits for its service manager. |
 | Git intake | `cnoc ingest` of a checkout's `jobs/` directory. |
-| Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. |
+| Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. Keyed runs (`--key`, or `key:` in the template) start once however often they are offered; `keyed` refuses a run with no key. |
 | When and where | `begin` (a time or a delay), `--on HOST` through a `host/NAME` feature, priority at submit and on a waiting job. |
 | Gate | `bun am-i-done`: one ordered list of checks with a deadline, modes for the git hooks, and output kept out of an agent's context. `bun doing-it-wrong`: a rule engine with fifteen rules, each with fixtures. CI runs the gate on Linux and macOS, and both jobs are required on `main`. |
 | Client install | `install.sh`: clone, `cnoc` command, config, and a systemd user unit or launchd agent that leaves tmux sessions alone on restart. |

@@ -3,12 +3,16 @@ import {
   JobfileError,
   checkTemplate,
   expand,
+  fill,
   instantiate,
+  isTemplate,
+  keyedId,
   parseAdapter,
   parseBegin,
   parseDuration,
   parseJob,
   shellQuote,
+  withId,
 } from "../src/jobfile";
 
 const job = (front: string, body: string) => `---\n${front}\n---\n${body}\n`;
@@ -192,6 +196,41 @@ describe("templates", () => {
       /cannot contain an argument/,
     );
     expect(() => checkTemplate(TEMPLATE.replace("HARNESS shell\n", ""))).toThrow(/PROMPT needs a HARNESS/);
+  });
+});
+
+describe("template keys", () => {
+  const KEYED = TEMPLATE.replace("id: maint/cleanup\n", "id: maint/cleanup\nkey: ${PROJECT}-${HOURS}\n");
+  test("a declared key is filled from the arguments and removed from the job", () => {
+    const f = fill(KEYED, { PROJECT: "myapp", HOURS: "007" });
+    expect(f.key).toBe("myapp-007");
+    expect(f.text.split("\n").length).toBe(KEYED.split("\n").length);
+    expect(parseJob(withId(f.text, keyedId("maint/cleanup", f.key ?? ""))).id).toBe("maint/cleanup/myapp-007");
+    expect(fill(TEMPLATE, { PROJECT: "myapp" }).key).toBeNull();
+    expect(fill(KEYED.replace("key: ${PROJECT}-${HOURS}", 'key: "a/${PROJECT}"'), { PROJECT: "b" }).key).toBe("a/b");
+    expect(checkTemplate(KEYED).name).toBe("maint/cleanup");
+  });
+
+  test("a key may contain slashes but must make a valid id", () => {
+    expect(keyedId("lane", "myapp/1234")).toBe("lane/myapp/1234");
+    expect(keyedId("lane", "#12")).toBe("lane/#12");
+    for (const bad of ["", "a b", "a//b", "/a", "a/", "x".repeat(200)])
+      expect(() => keyedId("lane", bad)).toThrow(/is not a valid id segment/);
+  });
+
+  test("a bad key is caught when the template is checked", () => {
+    expect(() => checkTemplate(KEYED.replace("${PROJECT}-${HOURS}", "two words"))).toThrow(/not a valid id segment/);
+    expect(() => checkTemplate(KEYED.replace("${PROJECT}-${HOURS}", ""))).toThrow(/line 3: key is empty/);
+    expect(() => checkTemplate(KEYED.replace("${PROJECT}-${HOURS}", "[1, 2]"))).toThrow(/not a valid id segment/);
+  });
+
+  test("key is legal only in a template", () => {
+    const plain = "---\nid: a\nkey: b\n---\nFROM app\nHARNESS shell\nPROMPT true\n";
+    expect(() => parseJob(plain)).toThrow(/key belongs in a template/);
+    expect(isTemplate(plain)).toBe(true);
+    expect(checkTemplate(plain)).toEqual({ name: "a", args: [] });
+    expect(isTemplate("---\nid: a\nlabels: { key: b }\n---\nFROM app\n")).toBe(false);
+    expect(isTemplate(TEMPLATE)).toBe(true);
   });
 });
 
