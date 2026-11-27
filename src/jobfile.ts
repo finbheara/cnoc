@@ -284,11 +284,10 @@ function argLines(text: string): Array<TemplateArg & { line: number }> {
   return out;
 }
 
-/** A template with its arguments filled in, and the key its front matter declares, if any. */
+/** A template with its arguments filled in. */
 export interface Filled {
   /** A plain Jobfile: the ARG lines and the `key:` line are blanked. Its id is still the template's name. */
   text: string;
-  key: string | null;
 }
 
 /**
@@ -320,7 +319,7 @@ export function fill(text: string, set: Record<string, string>): Filled {
     l.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => values.get(name) ?? whole),
   );
   if (at >= 0) filled[at] = "";
-  return { text: filled.join("\n"), key: declaredKey(text, set) };
+  return { text: filled.join("\n") };
 }
 
 /** Matches a top-level front matter line `name: ...`, with the name optionally quoted. */
@@ -344,8 +343,10 @@ export function declaredKey(text: string, set: Record<string, string>): string |
   const at = frontLine(lines, "key");
   if (at < 0) return null;
   const args = new Map(argLines(text).map((a) => [a.name, a]));
-  const raw = (lines[at] as string).replace(frontKey("key"), "").trim();
-  const filled = raw.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => {
+  // The line is read as written before anything is filled in, so an argument's value can
+  // never end the key early with a ` #` or a quote.
+  const written = keyText((lines[at] as string).replace(frontKey("key"), "").trim(), at + 1);
+  const filled = written.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => {
     const a = args.get(name);
     if (!a) return whole;
     const v = set[name] ?? a.default;
@@ -353,14 +354,16 @@ export function declaredKey(text: string, set: Record<string, string>): string |
     if (/[\r\n]/.test(v)) throw new JobfileError(`argument ${name} must be a single line`);
     return v;
   });
-  return keyValue(filled, at + 1);
+  if (filled === "") throw new JobfileError("key is empty", at + 1);
+  return filled;
 }
 
 /**
- * A key as written: bare text taken literally (so `007` stays `007`) up to a ` #` comment, or a
- * quoted YAML string.
+ * The `key:` value as the template writes it, before arguments are filled: bare text taken
+ * literally, not as a YAML number (so `0x7` stays `0x7`), up to a ` #` comment; or a quoted
+ * YAML string.
  */
-function keyValue(raw: string, line: number): string {
+function keyText(raw: string, line: number): string {
   let v = raw.replace(/\s+#.*$/, "");
   if (/^["']/.test(raw)) {
     try {
@@ -370,7 +373,6 @@ function keyValue(raw: string, line: number): string {
     }
     if (typeof v !== "string") throw new JobfileError(`key is not a valid string: ${raw}`, line);
   }
-  if (v === "") throw new JobfileError("key is empty", line);
   return v;
 }
 
@@ -424,9 +426,9 @@ export function checkTemplate(text: string): { name: string; args: TemplateArg[]
     throw new JobfileError("a template's id is its name and cannot contain an argument");
   // Arguments without a default are tried as "1", which is a valid name, count and duration.
   const trial = Object.fromEntries(args.filter((a) => a.default === null).map((a) => [a.name, "1"]));
-  const filled = fill(text, trial);
-  const name = parseJob(filled.text).id;
-  if (filled.key !== null) keyedId(name, filled.key);
+  const name = parseJob(fill(text, trial).text).id;
+  const key = declaredKey(text, trial);
+  if (key !== null) keyedId(name, key);
   return { name, args };
 }
 

@@ -203,12 +203,15 @@ describe("templates", () => {
 describe("template keys", () => {
   const KEYED = TEMPLATE.replace("id: maint/cleanup\n", "id: maint/cleanup\nkey: ${PROJECT}-${HOURS}\n");
   test("a declared key is filled from the arguments and removed from the job", () => {
-    const f = fill(KEYED, { PROJECT: "myapp", HOURS: "007" });
-    expect(f.key).toBe("myapp-007");
+    const set = { PROJECT: "myapp", HOURS: "007" };
+    const key = declaredKey(KEYED, set);
+    expect(key).toBe("myapp-007");
+    const f = fill(KEYED, set);
     expect(f.text.split("\n").length).toBe(KEYED.split("\n").length);
-    expect(parseJob(withId(f.text, keyedId("maint/cleanup", f.key ?? ""))).id).toBe("maint/cleanup/myapp-007");
-    expect(fill(TEMPLATE, { PROJECT: "myapp" }).key).toBeNull();
-    expect(fill(KEYED.replace("key: ${PROJECT}-${HOURS}", 'key: "a/${PROJECT}"'), { PROJECT: "b" }).key).toBe("a/b");
+    expect(f.text).not.toContain("key:");
+    expect(parseJob(withId(f.text, keyedId("maint/cleanup", key ?? ""))).id).toBe("maint/cleanup/myapp-007");
+    expect(declaredKey(KEYED.replace("${PROJECT}-${HOURS}", "0x7"), set)).toBe("0x7");
+    expect(declaredKey(KEYED.replace("key: ${PROJECT}-${HOURS}", 'key: "a/${PROJECT}"'), { PROJECT: "b" })).toBe("a/b");
     expect(checkTemplate(KEYED).name).toBe("maint/cleanup");
   });
 
@@ -233,6 +236,10 @@ describe("template keys", () => {
     expect(declaredKey(k("key: ${HOURS}h"), { NOPE: "1" })).toBe("12h");
     expect(() => declaredKey(k("key: ${PROJECT}"), {})).toThrow(/PROJECT has no default/);
     expect(declaredKey(TEMPLATE, {})).toBeNull();
+    // A comment or a quote inside an argument's value is part of the key, never the end of it.
+    expect(declaredKey(k("key: i-${PROJECT}"), { PROJECT: "7 #x" })).toBe("i-7 #x");
+    expect(declaredKey(k('key: "i-${PROJECT}" # c'), { PROJECT: '7" #x' })).toBe('i-7" #x');
+    expect(() => keyedId("dk", "i-7 #x")).toThrow(/not a valid id segment/);
   });
 
   test("a bad key is caught when the template is checked", () => {
@@ -252,7 +259,8 @@ describe("template keys", () => {
     const quoted = plain.replace("key: b", '"key": b');
     expect(isTemplate(quoted)).toBe(true);
     expect(checkTemplate(quoted)).toEqual({ name: "a", args: [] });
-    expect(fill(quoted, {}).key).toBe("b");
+    expect(declaredKey(quoted, {})).toBe("b");
+    expect(fill(quoted, {}).text).not.toContain("key");
   });
 });
 

@@ -258,6 +258,23 @@ test("a template can declare its key, and a key given with the run overrides it"
   expect(() => s.templateRun("lane", {}, {}, "t")).toThrow(/PROJECT has no default/);
 });
 
+test("a key in an argument's value cannot be cut short by a comment", () => {
+  s.templateAdd(T("dk").replace("id: dk\n", "id: dk\nkey: i-${PROJECT} # one per issue\n"), null, "t");
+  expect(s.templateRun("dk", { PROJECT: "7" }, {}, "t").job).toBe("dk/i-7");
+  for (const PROJECT of ["7 #x", "5 #x"])
+    expect(() => s.templateRun("dk", { PROJECT }, {}, "t")).toThrow(/not a valid id segment/);
+  expect(s.jobs().map((j) => j.id)).toEqual(["dk/i-7"]);
+});
+
+test("a key given with the run means the template's own key is not read", () => {
+  s.templateAdd(T("lane").replace("id: lane\n", "id: lane\nkey: ${NOTE}\n"), null, "t");
+  expect(() => s.templateRun("lane", { PROJECT: "app", NOTE: "" }, {}, "t")).toThrow(/key is empty/);
+  expect(s.templateRun("lane", { PROJECT: "app", NOTE: "" }, {}, "t", { key: "mine" })).toMatchObject({
+    job: "lane/mine",
+    created: true,
+  });
+});
+
 test("keyed refuses a run with no key; a key is never a run number", () => {
   s.templateAdd(T("lane"), null, "t");
   expect(() => s.templateRun("lane", {}, {}, "t", { keyed: true })).toThrow(SubmitError);
