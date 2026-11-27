@@ -670,6 +670,15 @@ const prompt = (cmd: string) => `HARNESS shell\nPROMPT ${JSON.stringify(cmd)}`;
 const ofJob = (jobId: string, type: string) => async () =>
   (await events()).find((e) => e.type === type && e.job === jobId)?.data as Record<string, unknown> | undefined;
 
+/** `cnoc show ID` against the test server. Asynchronous: the server answering it runs in this process. */
+async function show(jobId: string): Promise<string> {
+  const p = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"), "show", jobId], {
+    env: { PATH: process.env.PATH ?? "", HOME: root, CNOC_URL: server.url, CNOC_TOKEN: server.adminToken },
+    stdout: "pipe",
+  });
+  return new Response(p.stdout).text();
+}
+
 test("handoff MERGED ends the stage done, with its status and the session's tokens", async () => {
   const j = id("merged");
   const s = claudeSession("merged");
@@ -697,12 +706,7 @@ test("handoff MERGED ends the stage done, with its status and the session's toke
   expect(ended).toMatchObject({ outcome: "done", handoff: "MERGED", usage: [{ tokens: STANDARD_TOTAL }] });
   expect(await ofJob(j, "job.terminal")()).toEqual({ state: "done", reason: null, handoff: "MERGED" });
 
-  // Asynchronous: the server answering it runs in this process.
-  const show = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"), "show", j], {
-    env: { PATH: process.env.PATH ?? "", HOME: root, CNOC_URL: server.url, CNOC_TOKEN: server.adminToken },
-    stdout: "pipe",
-  });
-  const out = await new Response(show.stdout).text();
+  const out = await show(j);
   expect(out).toContain("stage 1: done  handoff MERGED  PR #88 merged");
   expect(out).toContain("tokens: claude 16 in, 57 out, 103 cache write, 104 cache read");
 });
@@ -737,4 +741,36 @@ test("a usage snapshot from a Stop hook is kept for a stage that ends without a 
     { status: "failed", reported: false, usage: { session: s.session, tokens: STANDARD_TOTAL } },
   ]);
   expect(await ofJob(j, "attempt.ended")()).toMatchObject({ outcome: "cancelled", usage: [{ responses: 3 }] });
+});
+
+test("a multi-stage job carries each stage's usage, and the handoff only of the stage that ended it", async () => {
+  const s = claudeSession("multi");
+  const two = (second: string) => `${s.env}${prompt('cnoc handoff merged -m "one"')}\nPROMPT ${JSON.stringify(second)}`;
+
+  const finished = id("multi-done");
+  await submit(job(finished, "", "", two('cnoc handoff MERGED -m "two"')));
+  await reaches(finished, "done");
+  expect(await ofJob(finished, "attempt.ended")()).toMatchObject({
+    outcome: "done",
+    handoff: "MERGED",
+    usage: [{ tokens: STANDARD_TOTAL }, { tokens: STANDARD_TOTAL }],
+  });
+
+  // Stage 1 hands off MERGED; stage 2 is cancelled after only a snapshot. The job did not end MERGED.
+  const hook = join(root, "multi-hook.json");
+  writeFileSync(hook, JSON.stringify({ session_id: s.session, transcript_path: s.transcript }));
+  const stopped = id("multi-cancelled");
+  await submit(job(stopped, "", "", two(`cnoc usage < ${hook} && cnoc progress snapped && sleep 60`)));
+  await until("the second stage's snapshot", ofJob(stopped, "attempt.progress"));
+  await api("POST", `/v1/job/cancel?id=${encodeURIComponent(stopped)}`);
+  const cancelled = await reaches(stopped, "cancelled");
+  expect(cancelled.result).toMatchObject([
+    { status: "done", handoff: "MERGED", usage: { responses: 3 } },
+    { reported: false, usage: { responses: 3 } },
+  ]);
+  const ended = await ofJob(stopped, "attempt.ended")();
+  expect(ended).toMatchObject({ outcome: "cancelled", usage: [{ responses: 3 }, { responses: 3 }] });
+  expect(ended?.handoff).toBeUndefined();
+  expect((await ofJob(stopped, "job.terminal")())?.handoff).toBeUndefined();
+  expect(await show(stopped)).toContain("stage 2: no report  ");
 });

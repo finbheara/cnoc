@@ -155,9 +155,14 @@ usage: { harness, session, responses, at,
          partial?: "why the numbers are a lower bound" }
 ```
 
-- No session, no transcript or an unreadable file means no `usage`; the result is never refused for it. A time limit or an unparseable line that carried usage gives `partial`.
-- `cnoc usage` is for a Claude Code `Stop` hook: it takes `session_id` and `transcript_path` from the hook's JSON on stdin when present, is silent and always exits 0. The client keeps the latest snapshot per stage. A report without usage takes it; a stage that ends with no report (no result, time limit, cancel) gets a result `{ status: "failed", summary: <reason>, reported: false, usage }` so the numbers are not lost.
-- A session does not inherit a harness session variable from the client's own environment; a job's `ENV` may set one.
+- No session, no transcript, a main transcript that is not a regular readable file means no `usage`; the result is never refused for it. A time limit, an unreadable subagent file or an unparseable line that carried usage gives `partial`. Symbolic links under `subagents/` are not followed, and the search goes four levels deep.
+- The read checks its time limit between chunks, and the whole collection is raced against the limit plus half a second, so a read that never returns (a FIFO, a hung mount) gives no usage and the report still goes out. Each call to the client's socket has a 10-second timeout.
+- `cnoc usage` is for a Claude Code `Stop` hook: it takes `session_id` and `transcript_path` from the hook's JSON on stdin when present, is silent and always exits 0. The client keeps the latest snapshot per stage.
+- Every session command sends the stage it was started under (`CNOC_STAGE`); the client refuses a report, and drops a snapshot, from a stage that is over.
+- When a report carries usage and a snapshot exists too, the stage keeps the complete one over a partial one, then the one that counted more responses.
+- A stage that ends with no report (no result, time limit, cancel, launch failure) but has a snapshot gets the result `{ status: "failed", summary: <reason>, reported: false, usage }`. **An entry with `reported: false` is not a report:** it exists only to carry the usage, its `status` is always `failed` whatever the attempt's outcome (a cancelled attempt included), and a consumer must check `reported` before reading `status` or `summary` as the agent's word. `cnoc show` prints it as `no report`.
+- The client checks usage from the socket before passing it on: counts, `responses` and `at` must be non-negative integers, names at most 200 characters, at most 32 models (the reader counts any beyond 31 together as `(other)`); what does not conform is dropped.
+- A session never inherits a harness session variable (`CLAUDE_CODE_SESSION_ID`) from the client or from the tmux server's global environment: it is set empty. A job's `ENV` may set one.
 - The commands talk to the client over a local socket using a per-attempt token. A job holds no server credential.
 - The same socket forwards server API calls, so a job can submit follow-up jobs. They are recorded as submitted by the host.
 
@@ -300,7 +305,7 @@ Each event is `{ seq, ts, type, job, attempt, host, actor, data }`. `seq` increa
 | `job.priority` | A waiting job's priority was changed. |
 | `template.added`, `.updated`, `.removed` | A template changed. |
 | `template.run` | A template started a job; the event names the job, the arguments and the key, if any. A keyed run that changed nothing has no event. |
-| `job.terminal` | The job is `done`, `failed` or `cancelled`. Data: `state`, `reason`, and `handoff` when the last stage was handed off. |
+| `job.terminal` | The job is `done`, `failed` or `cancelled`. Data: `state`, `reason`, and `handoff` when the stage that ended the attempt reported one and its outcome is the attempt's (never an earlier stage's). |
 | `attempt.assigned`, `.returned`, `.started`, `.progress`, `.ended` | The life of one attempt. `.ended` data: `outcome`, `reason`, `handoff` as above, and `usage`, one entry per stage result (null where none), when any stage has usage. |
 | `attempt.late_report` | A result arrived for an attempt that was no longer open. It is not applied. |
 | `host.pending`, `.approved`, `.online`, `.offline`, `.drained`, `.undrained` | Host lifecycle. |

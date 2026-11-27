@@ -491,7 +491,7 @@ export class Store {
         "UPDATE attempts SET state = 'ended', outcome = ?, reason = ?, ended_at = ?, result = ? WHERE id = ?",
         [end.outcome, end.reason, Date.now(), json(end.results), a.id],
       );
-      const { handoff, usage } = reportedFields(end.results);
+      const { handoff, usage } = reportedFields(end.results, end.outcome);
       this.emit("attempt.ended", {
         job: a.job,
         attempt: a.id,

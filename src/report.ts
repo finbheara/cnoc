@@ -2,7 +2,7 @@
  * The session side of the result contract: `cnoc done`, `fail`, `handoff` and `usage`, run by the
  * harness inside a job, and the client-side check of what they send over the local socket.
  */
-import type { StageResult, Usage } from "./protocol";
+import type { Outcome, StageResult, Usage } from "./protocol";
 import { type HookInput, cleanUsage, collectUsage } from "./usage";
 
 /**
@@ -16,6 +16,8 @@ export const HANDOFF: Record<string, { status: StageResult["status"]; needsMessa
 
 /** How long `cnoc usage` waits for a hook's JSON on stdin before it uses the environment alone. */
 const STDIN_WAIT_MS = 1000;
+/** How long a call to the client's local socket may take. */
+export const LOCAL_SOCKET_MS = 10_000;
 
 export class ReportError extends Error {}
 
@@ -60,16 +62,31 @@ export function readResult(body: unknown): StageResult | string {
 }
 
 /**
+ * The stage a session command was started under (`CNOC_STAGE`, counted from 1), sent with it so
+ * the client can drop one that arrives after its stage is over. A string is why it was refused.
+ */
+export function wrongStage(body: unknown, current: number): string | null {
+  const stage = (body as { stage?: unknown } | null)?.stage;
+  if (stage === undefined) return null; // From a session command that predates the field.
+  return stage === current ? null : `stage ${String(stage)} is over; this attempt is on stage ${current}`;
+}
+
+/**
  * What the changelog carries from an attempt's results: the handoff status of the stage that ended
  * it, and each stage's usage (null where there is none). Fields with nothing to say are left out.
+ *
+ * The handoff is only the attempt's if its last result is a report whose stage outcome is the
+ * attempt's outcome. A later stage that ended without a report leaves no entry, or an unreported
+ * one, and an earlier stage's handoff must not stand for it.
  */
-export function reportedFields(results: StageResult[]): {
-  handoff: { handoff?: string };
-  usage: { usage?: Array<Usage | null> };
-} {
-  const last = results.at(-1)?.handoff;
+export function reportedFields(
+  results: StageResult[],
+  outcome: Outcome,
+): { handoff: { handoff?: string }; usage: { usage?: Array<Usage | null> } } {
+  const last = results.at(-1);
+  const ended = last?.handoff && last.reported !== false && last.status === outcome ? last.handoff : null;
   const usage = results.some((r) => r.usage) ? { usage: results.map((r) => r.usage ?? null) } : {};
-  return { handoff: last ? { handoff: last } : {}, usage };
+  return { handoff: ended ? { handoff: ended } : {}, usage };
 }
 
 /** Calls the client's local socket with this attempt's token. */
@@ -82,6 +99,7 @@ async function local<T>(path: string, body: unknown): Promise<T> {
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify(body),
     unix: sock,
+    signal: AbortSignal.timeout(LOCAL_SOCKET_MS),
   } as RequestInit).catch((e: Error) => {
     throw new ReportError(`cannot reach ${sock}: ${e.message}`);
   });
@@ -94,10 +112,19 @@ async function local<T>(path: string, body: unknown): Promise<T> {
 export async function report(result: Pick<StageResult, "status" | "summary" | "handoff">): Promise<void> {
   if (!process.env.CNOC_SOCK) throw new ReportError("not inside a Cnoc job (CNOC_SOCK is not set)");
   const usage = await collectUsage();
-  const r = await local<{ accepted: boolean }>("/attempt/result", { ...result, ...(usage ? { usage } : {}) });
+  const r = await local<{ accepted: boolean }>("/attempt/result", {
+    ...result,
+    ...stage(),
+    ...(usage ? { usage } : {}),
+  });
   const what = result.handoff ? `handoff ${result.handoff} (${result.status})` : result.status;
   console.log(r.accepted ? `reported ${what}` : "a result was already reported for this stage");
 }
+
+const stage = (): { stage?: number } => {
+  const n = Number(process.env.CNOC_STAGE);
+  return Number.isInteger(n) && n > 0 ? { stage: n } : {};
+};
 
 async function hookInput(): Promise<HookInput | null> {
   if (process.stdin.isTTY) return null;
@@ -127,7 +154,7 @@ export async function snapshot(print: boolean): Promise<void> {
     if (!inside && !print) return;
     const usage = await collectUsage(process.env, await hookInput());
     if (print) console.log(JSON.stringify(usage, null, 2));
-    if (usage && inside) await local("/attempt/usage", { usage });
+    if (usage && inside) await local("/attempt/usage", { usage, ...stage() });
   } catch {
     // A hook that fails or prints is worse than a missing number.
   }

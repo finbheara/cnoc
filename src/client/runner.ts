@@ -4,7 +4,7 @@
  */
 import { type Adapter, type Step, expand, shellQuote } from "../jobfile";
 import type { AttemptEnd, JobSpec, StageResult, Usage } from "../protocol";
-import { SESSION_VARS } from "../usage";
+import { SESSION_VARS, betterUsage } from "../usage";
 import type { Tmux } from "./tmux";
 
 /** Persisted so a restarted client can pick the attempt up again. */
@@ -36,8 +36,9 @@ export interface RunnerDeps {
 }
 
 export const REPORT =
-  'When you finish, report once with the cnoc command the task above names. If it names none, run `cnoc done "<one-line summary>"`, ' +
-  'or `cnoc fail "<reason>"` if it cannot be completed. Use `cnoc progress "<note>"` for milestones.';
+  "When you finish, report once: if the task above names a closing command (cnoc done, fail or handoff), run that. " +
+  'Otherwise run `cnoc done "<one-line summary>"`, or `cnoc fail "<reason>"` if it cannot be completed. ' +
+  'Use `cnoc progress "<note>"` for milestones.';
 
 export const sessionName = (attempt: number, stage: number): string => `cnoc-${attempt}-${stage}`;
 
@@ -115,7 +116,8 @@ export class AttemptRunner {
       await this.close(session, true);
       if (verdict.kind === "end") return this.endUnreported(verdict.outcome, verdict.reason);
       const result = st.reported as StageResult;
-      if (!result.usage && st.usage) result.usage = st.usage;
+      const usage = betterUsage(result.usage, st.usage);
+      if (usage) result.usage = usage;
       st.results.push(result);
       st.reported = null;
       st.usage = null;
@@ -153,9 +155,10 @@ export class AttemptRunner {
       if (step.op === "tmux") {
         const cmd = expand(step.cmd, this.vars(), (name, v) => (QUOTED.has(name) ? shellQuote(v) : v));
         const env = {
-          // A client started from inside a harness session must not hand that session's id to its jobs,
-          // or their reports would carry its usage. A job's ENV may still set one.
-          ...Object.fromEntries(SESSION_VARS.filter((v) => process.env[v] !== undefined).map((v) => [v, ""])),
+          // The session must not inherit a harness session id, from the client or from the global
+          // environment of the tmux server (kept from whichever process started it), or its reports
+          // would carry that session's usage. Empty, because tmux cannot unset; a job's ENV may set one.
+          ...Object.fromEntries(SESSION_VARS.map((v) => [v, ""])),
           ...st.spec.env,
           ...deps.baseEnv,
           CNOC_TOKEN: st.token,

@@ -22,7 +22,7 @@ import { join, resolve } from "node:path";
 import { type Adapter, parseAdapter } from "../jobfile";
 import type { AttemptEnd, ClientMsg, Measured, Resources, ServerMsg } from "../protocol";
 import { PROTOCOL, VERSION } from "../protocol";
-import { readResult } from "../report";
+import { readResult, wrongStage } from "../report";
 import { cleanUsage } from "../usage";
 import { AttemptRunner, type AttemptState } from "./runner";
 import { Tmux } from "./tmux";
@@ -483,12 +483,18 @@ export class CnocClient {
       return Response.json({ ok: true, delivered: this.connected });
     }
     if (url.pathname === "/attempt/result" && req.method === "POST") {
-      const result = readResult(await req.json());
+      const body = await req.json().catch(() => null);
+      const late = wrongStage(body, runner.state.stage + 1);
+      if (late) return Response.json({ error: late }, { status: 409 });
+      const result = readResult(body);
       if (typeof result === "string") return Response.json({ error: result }, { status: 400 });
       return Response.json({ ok: true, accepted: runner.report(result) });
     }
     if (url.pathname === "/attempt/usage" && req.method === "POST") {
-      const usage = cleanUsage(((await req.json()) as { usage?: unknown }).usage);
+      const body = (await req.json().catch(() => null)) as { usage?: unknown } | null;
+      if (!body || typeof body !== "object") return Response.json({ error: "expected { usage }" }, { status: 400 });
+      const late = wrongStage(body, runner.state.stage + 1);
+      const usage = late ? undefined : cleanUsage(body.usage);
       if (usage) runner.snapshot(usage);
       return Response.json({ ok: true, recorded: Boolean(usage) });
     }

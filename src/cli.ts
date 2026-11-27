@@ -423,8 +423,8 @@ async function main(): Promise<void> {
           `  attempt ${a.id} on ${a.host}: ${a.state}${a.outcome ? ` ${a.outcome}` : ""}${a.reason ? ` (${a.reason})` : ""}`,
         );
       for (const [i, s] of (j.result ?? []).entries()) {
-        const how = s.handoff ? `  handoff ${s.handoff}` : s.reported === false ? "  (no report)" : "";
-        console.log(`  stage ${i + 1}: ${s.status}${how}  ${s.summary}`);
+        const how = s.reported === false ? "no report" : `${s.status}${s.handoff ? `  handoff ${s.handoff}` : ""}`;
+        console.log(`  stage ${i + 1}: ${how}  ${s.summary}`);
         if (s.usage) console.log(`    tokens: ${formatUsage(s.usage)}`);
       }
       return;
@@ -492,12 +492,16 @@ async function main(): Promise<void> {
       await api<unknown>("POST", "/attempt/progress", { note: pos.join(" ") });
       return;
     }
+    // Each exits once its report is answered: a transcript read given up at its time limit may leave a file open.
     case "done":
-      return report({ status: "done", summary: pos.join(" ") });
+      await report({ status: "done", summary: pos.join(" ") });
+      return process.exit(0);
     case "fail":
-      return report({ status: "failed", summary: pos.join(" ") });
+      await report({ status: "failed", summary: pos.join(" ") });
+      return process.exit(0);
     case "handoff":
-      return report(parseHandoff(rest));
+      await report(parseHandoff(rest));
+      return process.exit(0);
     case "usage":
       await snapshot(rest.includes("--print"));
       return process.exit(0);

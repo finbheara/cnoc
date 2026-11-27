@@ -173,17 +173,17 @@ The built-in adapters append these instructions to the prompt, worded so that a 
 
 When `done`, `fail` or `handoff` runs inside a Claude Code session, it reads that session's transcript (found by `CLAUDE_CODE_SESSION_ID` under `$CLAUDE_CONFIG_DIR` or `~/.claude`, subagents included) and sends the token counts with the result: input, output, cache writes and cache reads, in total and per model. No prices. `cnoc show ID` prints them, and the job API and the `attempt.ended` event carry them as `usage`. Reading is bounded to a few seconds; if the transcript cannot be found the result goes through without usage, and if it can only be read in part the usage says so in `partial`.
 
-An agent may stop, crash or run out of time without reporting. `cnoc usage` records the usage so far without ending the stage, and the latest one is kept on the stage's result if it ends with no report. Run it from a `Stop` hook in the project's `.claude/settings.json` or in `~/.claude/settings.json`:
+An agent may stop, crash or run out of time without reporting. `cnoc usage` records the usage so far without ending the stage, and the latest one is kept on the stage's result if it ends with no report (shown as `no report` by `cnoc show`). Run it from a `Stop` hook, usually in the project's `.claude/settings.json` on each host:
 
 ```json
 {
   "hooks": {
-    "Stop": [{ "hooks": [{ "type": "command", "command": "cnoc usage" }] }]
+    "Stop": [{ "hooks": [{ "type": "command", "command": "command -v cnoc >/dev/null && cnoc usage; true" }] }]
   }
 }
 ```
 
-It reads the hook's input from stdin, prints nothing and always exits 0, so it is harmless in sessions that are not Cnoc jobs. `cnoc usage --print` shows what it would record.
+`cnoc usage` reads the hook's input from stdin, prints nothing and always exits 0, so it is harmless in sessions that are not Cnoc jobs. The guard keeps the hook quiet where `cnoc` is not on `PATH`, which matters if you put it in `~/.claude/settings.json`, where it runs in every session. `cnoc usage --print` shows what it would record.
 
 ## Harness adapters
 
