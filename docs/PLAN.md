@@ -4,7 +4,7 @@ What exists, what does not, and the order to build the rest. The design is in [S
 
 ## Built and tested
 
-Tested means covered by `bun test`: 41 unit tests and 22 end-to-end tests that run a real server, real clients and real tmux sessions.
+Tested means covered by `bun test`: 78 tests of cnoc itself, 25 of them end to end with a real server, real clients and real tmux sessions, and 274 specs of the gate.
 
 | Area | What works |
 |---|---|
@@ -19,6 +19,7 @@ Tested means covered by `bun test`: 41 unit tests and 22 end-to-end tests that r
 | Git intake | `cnoc ingest` of a checkout's `jobs/` directory. |
 | Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. |
 | When and where | `begin` (a time or a delay), `--on HOST` through a `host/NAME` feature, priority at submit and on a waiting job. |
+| Gate | `bun am-i-done`: one ordered list of checks with a deadline, modes for the git hooks, and output kept out of an agent's context. `bun doing-it-wrong`: a rule engine with fifteen rules, each with fixtures. CI runs the gate on Linux and macOS, and both jobs are required on `main`. |
 | Client install | `install.sh`: clone, `cnoc` command, config, and a systemd user unit or launchd agent that leaves tmux sessions alone on restart. |
 
 Checked by hand, not by the test suite:
@@ -78,6 +79,15 @@ In rough order of value.
 - **Recurring schedules.** A template can be started at a time, once. Nothing starts it every night; an external timer calling `cnoc template run` does that today.
 - **Templates from git.** `cnoc ingest` submits jobs only. Templates are added by hand.
 - **Server backup or a warm spare.** The whole state is one SQLite file; nothing copies it yet.
+
+### 7. The gate
+
+Brought across without these parts of the gate it was taken from:
+
+- **Coverage ratchet**, per-file spec accounting and per-file timing. `--ci` is the same list as `--pre-push` until they exist.
+- **Stale-todo check.** A `dotw-todo` must name an issue, but nothing fails when that issue is closed.
+- **Dead-module check.**
+- **File size.** The cap is 750 lines because five files were over 400 when the rule landed. Splitting them and lowering the cap is open.
 
 ## Open questions
 

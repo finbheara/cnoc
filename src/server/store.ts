@@ -119,7 +119,10 @@ export class Store {
     return () => this.listeners.delete(fn);
   }
 
-  emit(type: string, f: { job?: string; attempt?: number; host?: string; actor?: string; data?: unknown } = {}): number {
+  emit(
+    type: string,
+    f: { job?: string; attempt?: number; host?: string; actor?: string; data?: unknown } = {},
+  ): number {
     const r = this.db.run("INSERT INTO events(ts, type, job, attempt, host, actor, data) VALUES(?,?,?,?,?,?,?)", [
       Date.now(),
       type,
@@ -147,7 +150,8 @@ export class Store {
   }
 
   meta(k: string, set?: string): string | null {
-    if (set !== undefined) this.db.run("INSERT INTO meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", [k, set]);
+    if (set !== undefined)
+      this.db.run("INSERT INTO meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", [k, set]);
     return (this.db.query("SELECT v FROM meta WHERE k = ?").get(k) as { v: string } | null)?.v ?? null;
   }
 
@@ -181,7 +185,12 @@ export class Store {
     return (this.db.query("SELECT job FROM deps WHERE dep = ?").all(id) as Array<{ job: string }>).map((r) => r.job);
   }
 
-  private setJob(id: string, state: JobState, reason: string | null, extra: { result?: unknown; cancel?: 0 } = {}): void {
+  private setJob(
+    id: string,
+    state: JobState,
+    reason: string | null,
+    extra: { result?: unknown; cancel?: 0 } = {},
+  ): void {
     this.db.run("UPDATE jobs SET state = ?, reason = ?, updated_at = ? WHERE id = ?", [state, reason, Date.now(), id]);
     if (extra.result !== undefined) this.db.run("UPDATE jobs SET result = ? WHERE id = ?", [json(extra.result), id]);
     if (extra.cancel === 0) this.db.run("UPDATE jobs SET cancel_requested = 0 WHERE id = ?", [id]);
@@ -207,7 +216,8 @@ export class Store {
   ): Array<{ id: string; state: JobState; created: boolean }> {
     const now = Date.now();
     if (over.on !== undefined && !this.host(over.on)) throw new SubmitError(`no such host: ${over.on}`, 404);
-    if (over.priority !== undefined && !Number.isInteger(over.priority)) throw new SubmitError("priority must be an integer");
+    if (over.priority !== undefined && !Number.isInteger(over.priority))
+      throw new SubmitError("priority must be an integer");
     const specs = bodies.map((body, i) => {
       try {
         const spec = parseJob(body, now);
@@ -228,11 +238,13 @@ export class Store {
     }
     const fresh = specs.filter(({ body, spec }) => {
       const have = this.job(spec.id);
-      if (have && have.body !== body) throw new SubmitError(`job ${spec.id} already exists with different content`, 409);
+      if (have && have.body !== body)
+        throw new SubmitError(`job ${spec.id} already exists with different content`, 409);
       return !have;
     });
     for (const { spec } of fresh) {
-      for (const d of spec.depends) if (!batch.has(d) && !this.job(d)) throw new SubmitError(`job ${spec.id} depends on unknown job ${d}`);
+      for (const d of spec.depends)
+        if (!batch.has(d) && !this.job(d)) throw new SubmitError(`job ${spec.id} depends on unknown job ${d}`);
     }
     // Existing jobs cannot point at new ones, so a cycle can only run through this batch.
     const visiting = new Set<string>();
@@ -266,7 +278,12 @@ export class Store {
         this.emit("job.submitted", {
           job: spec.id,
           actor,
-          data: { state: rest.state, project: spec.project, depends: spec.depends, ...(Object.keys(over).length ? { overrides: over } : {}) },
+          data: {
+            state: rest.state,
+            project: spec.project,
+            depends: spec.depends,
+            ...(Object.keys(over).length ? { overrides: over } : {}),
+          },
         });
       }
       for (const { spec } of specs) {
@@ -293,7 +310,13 @@ export class Store {
     }
   }
 
-  private finish(id: string, state: "done" | "failed" | "cancelled", reason: string | null, result: unknown, actor?: string): void {
+  private finish(
+    id: string,
+    state: "done" | "failed" | "cancelled",
+    reason: string | null,
+    result: unknown,
+    actor?: string,
+  ): void {
     this.setJob(id, state, reason, { result, cancel: 0 });
     this.emit("job.terminal", { job: id, actor, data: { state, reason } });
     this.wake(id);
@@ -319,7 +342,8 @@ export class Store {
     return this.db.transaction(() => {
       const j = this.job(id);
       if (!j) throw new SubmitError(`no such job: ${id}`, 404);
-      if (j.state !== "failed" && j.state !== "cancelled") throw new SubmitError(`job ${id} is ${j.state}; only failed or cancelled jobs can be requeued`, 409);
+      if (j.state !== "failed" && j.state !== "cancelled")
+        throw new SubmitError(`job ${id} is ${j.state}; only failed or cancelled jobs can be requeued`, 409);
       const rest = this.restingState(j.spec);
       this.setJob(id, rest.state, rest.reason, { cancel: 0 });
       this.emit("job.requeued", { job: id, actor, data: { state: rest.state } });
@@ -333,9 +357,17 @@ export class Store {
       const j = this.job(id);
       if (!j) throw new SubmitError(`no such job: ${id}`, 404);
       if (!Number.isInteger(priority)) throw new SubmitError("priority must be an integer");
-      if (j.state !== "queued" && j.state !== "blocked") throw new SubmitError(`job ${id} is ${j.state}; only a job that has not been dispatched can be reprioritised`, 409);
+      if (j.state !== "queued" && j.state !== "blocked")
+        throw new SubmitError(
+          `job ${id} is ${j.state}; only a job that has not been dispatched can be reprioritised`,
+          409,
+        );
       if (j.spec.priority !== priority) {
-        this.db.run("UPDATE jobs SET spec = ?, updated_at = ? WHERE id = ?", [json({ ...j.spec, priority }), Date.now(), id]);
+        this.db.run("UPDATE jobs SET spec = ?, updated_at = ? WHERE id = ?", [
+          json({ ...j.spec, priority }),
+          Date.now(),
+          id,
+        ]);
         this.emit("job.priority", { job: id, actor, data: { from: j.spec.priority, to: priority } });
       }
       return this.job(id) as JobRow;
@@ -357,7 +389,9 @@ export class Store {
   }
 
   templates(): TemplateRow[] {
-    return (this.db.query("SELECT * FROM templates ORDER BY id").all() as Raw[]).map((r) => this.templateRow(r) as TemplateRow);
+    return (this.db.query("SELECT * FROM templates ORDER BY id").all() as Raw[]).map(
+      (r) => this.templateRow(r) as TemplateRow,
+    );
   }
 
   /** Finds a template by number, by name, or by the file it was added from. */
@@ -372,7 +406,11 @@ export class Store {
   }
 
   /** Saves a template. Adding the same name again replaces its content and keeps its number. */
-  templateAdd(body: string, source: string | null, actor: string): { template: TemplateRow; result: "added" | "updated" | "unchanged" } {
+  templateAdd(
+    body: string,
+    source: string | null,
+    actor: string,
+  ): { template: TemplateRow; result: "added" | "updated" | "unchanged" } {
     let name: string;
     try {
       name = checkTemplate(body).name;
@@ -385,10 +423,21 @@ export class Store {
       const now = Date.now();
       let result: "added" | "updated" | "unchanged" = "unchanged";
       if (!have) {
-        this.db.run("INSERT INTO templates(name, body, source, added_at, updated_at) VALUES(?,?,?,?,?)", [name, body, source, now, now]);
+        this.db.run("INSERT INTO templates(name, body, source, added_at, updated_at) VALUES(?,?,?,?,?)", [
+          name,
+          body,
+          source,
+          now,
+          now,
+        ]);
         result = "added";
       } else if (have.body !== body) {
-        this.db.run("UPDATE templates SET body = ?, source = ?, updated_at = ? WHERE id = ?", [body, source ?? have.source, now, have.id]);
+        this.db.run("UPDATE templates SET body = ?, source = ?, updated_at = ? WHERE id = ?", [
+          body,
+          source ?? have.source,
+          now,
+          have.id,
+        ]);
         result = "updated";
       }
       const template = this.template(name) as TemplateRow;
@@ -406,7 +455,12 @@ export class Store {
   }
 
   /** Submits a new job made from a template. Jobs it started earlier are not affected by later edits. */
-  templateRun(ref: string, set: Record<string, string>, over: Overrides, actor: string): { template: TemplateRow; job: string } {
+  templateRun(
+    ref: string,
+    set: Record<string, string>,
+    over: Overrides,
+    actor: string,
+  ): { template: TemplateRow; job: string } {
     return this.db.transaction(() => {
       const t = this.template(ref);
       if (!t) throw new SubmitError(`no such template: ${ref}`, 404);
@@ -425,7 +479,11 @@ export class Store {
         throw e;
       }
       this.submit([text], actor, over, { template: t.name });
-      this.db.run("UPDATE templates SET runs = runs + 1, last_run_at = ?, last_job = ? WHERE id = ?", [Date.now(), job, t.id]);
+      this.db.run("UPDATE templates SET runs = runs + 1, last_run_at = ?, last_job = ? WHERE id = ?", [
+        Date.now(),
+        job,
+        t.id,
+      ]);
       this.emit("template.run", { job, actor, data: { template: t.id, name: t.name, set } });
       return { template: this.template(String(t.id)) as TemplateRow, job };
     })();
@@ -442,11 +500,17 @@ export class Store {
   }
 
   attemptsOf(job: string): AttemptRow[] {
-    return (this.db.query("SELECT * FROM attempts WHERE job = ? ORDER BY id").all(job) as Raw[]).map((r) => this.attemptRow(r) as AttemptRow);
+    return (this.db.query("SELECT * FROM attempts WHERE job = ? ORDER BY id").all(job) as Raw[]).map(
+      (r) => this.attemptRow(r) as AttemptRow,
+    );
   }
 
   openAttempt(job: string): AttemptRow | null {
-    return this.attemptRow(this.db.query("SELECT * FROM attempts WHERE job = ? AND state IN ('assigned','running') ORDER BY id DESC").get(job) as Raw | null);
+    return this.attemptRow(
+      this.db
+        .query("SELECT * FROM attempts WHERE job = ? AND state IN ('assigned','running') ORDER BY id DESC")
+        .get(job) as Raw | null,
+    );
   }
 
   openAttempts(host?: string): AttemptRow[] {
@@ -458,7 +522,12 @@ export class Store {
 
   assign(job: string, host: string): AttemptRow {
     return this.db.transaction(() => {
-      const r = this.db.run("INSERT INTO attempts(job, host, state, assigned_at) VALUES(?,?,?,?)", [job, host, "assigned", Date.now()]);
+      const r = this.db.run("INSERT INTO attempts(job, host, state, assigned_at) VALUES(?,?,?,?)", [
+        job,
+        host,
+        "assigned",
+        Date.now(),
+      ]);
       const id = Number(r.lastInsertRowid);
       this.setJob(job, "assigned", null);
       this.emit("attempt.assigned", { job, attempt: id, host });
@@ -471,7 +540,11 @@ export class Store {
     this.db.transaction(() => {
       const a = this.attempt(id);
       if (!a || a.state !== "assigned") return;
-      this.db.run("UPDATE attempts SET state = 'returned', reason = ?, ended_at = ? WHERE id = ?", [reason, Date.now(), id]);
+      this.db.run("UPDATE attempts SET state = 'returned', reason = ?, ended_at = ? WHERE id = ?", [
+        reason,
+        Date.now(),
+        id,
+      ]);
       const j = this.job(a.job);
       if (j?.cancel_requested) this.finish(a.job, "cancelled", "cancelled-before-start", null);
       else this.setJob(a.job, "queued", null);
@@ -491,7 +564,10 @@ export class Store {
       const j = this.job(a.job);
       const adoptable = a.state === "returned" && j?.state === "queued";
       if (a.state !== "assigned" && !adoptable) return "stale";
-      this.db.run("UPDATE attempts SET state = 'running', reason = NULL, ended_at = NULL, started_at = COALESCE(started_at, ?) WHERE id = ?", [Date.now(), id]);
+      this.db.run(
+        "UPDATE attempts SET state = 'running', reason = NULL, ended_at = NULL, started_at = COALESCE(started_at, ?) WHERE id = ?",
+        [Date.now(), id],
+      );
       this.setJob(a.job, "running", null);
       this.emit("attempt.started", { job: a.job, attempt: id, host, data: adoptable ? { adopted: true } : null });
       return "ok";
@@ -507,14 +583,16 @@ export class Store {
         return "stale";
       }
       const a = this.attempt(end.attempt) as AttemptRow;
-      this.db.run("UPDATE attempts SET state = 'ended', outcome = ?, reason = ?, ended_at = ?, result = ? WHERE id = ?", [
-        end.outcome,
-        end.reason,
-        Date.now(),
-        json(end.results),
-        a.id,
-      ]);
-      this.emit("attempt.ended", { job: a.job, attempt: a.id, host, data: { outcome: end.outcome, reason: end.reason } });
+      this.db.run(
+        "UPDATE attempts SET state = 'ended', outcome = ?, reason = ?, ended_at = ?, result = ? WHERE id = ?",
+        [end.outcome, end.reason, Date.now(), json(end.results), a.id],
+      );
+      this.emit("attempt.ended", {
+        job: a.job,
+        attempt: a.id,
+        host,
+        data: { outcome: end.outcome, reason: end.reason },
+      });
       this.finish(a.job, end.outcome, end.reason, end.results);
       return "ok";
     })();
@@ -525,7 +603,11 @@ export class Store {
     this.db.transaction(() => {
       const a = this.attempt(id);
       if (!a || (a.state !== "assigned" && a.state !== "running")) return;
-      this.db.run("UPDATE attempts SET state = 'ended', outcome = 'failed', reason = ?, ended_at = ? WHERE id = ?", [reason, Date.now(), id]);
+      this.db.run("UPDATE attempts SET state = 'ended', outcome = 'failed', reason = ?, ended_at = ? WHERE id = ?", [
+        reason,
+        Date.now(),
+        id,
+      ]);
       this.emit("attempt.ended", { job: a.job, attempt: id, host: a.host, actor, data: { outcome: "failed", reason } });
       this.finish(a.job, "failed", reason, null, actor);
     })();
@@ -557,7 +639,11 @@ export class Store {
   }
 
   enroll(name: string, pubkey: string, approved: boolean): HostRow {
-    this.db.run("INSERT INTO hosts(name, pubkey, status) VALUES(?,?,?)", [name, pubkey, approved ? "approved" : "pending"]);
+    this.db.run("INSERT INTO hosts(name, pubkey, status) VALUES(?,?,?)", [
+      name,
+      pubkey,
+      approved ? "approved" : "pending",
+    ]);
     this.emit(approved ? "host.approved" : "host.pending", { host: name });
     return this.host(name) as HostRow;
   }
@@ -615,7 +701,12 @@ export class Store {
   }
 
   subscribe(url: string, types: string[], secret: string, from: number): Subscription {
-    const r = this.db.run("INSERT INTO subscriptions(url, types, secret, cursor) VALUES(?,?,?,?)", [url, json(types), secret, from]);
+    const r = this.db.run("INSERT INTO subscriptions(url, types, secret, cursor) VALUES(?,?,?,?)", [
+      url,
+      json(types),
+      secret,
+      from,
+    ]);
     return this.subscriptions().find((s) => s.id === Number(r.lastInsertRowid)) as Subscription;
   }
 

@@ -227,6 +227,14 @@ Every state change is one numbered event. Read it three ways:
 ## Development
 
 ```
-bun install
-bun run am-i-done     # typecheck and tests; the end-to-end tests need tmux
+bun install          # also points git at the hooks in .git-hooks/
+bun am-i-done        # the one definition of done
 ```
+
+`bun am-i-done` runs every check in order and stops at the first that fails: install, typecheck, lint, the project rules, the example Jobfiles, shellcheck, then the whole test suite. It needs tmux and shellcheck on `PATH`.
+
+- `--pre-commit` runs the static checks and `--pre-push` adds the tests; the git hooks call these.
+- CI runs `bun am-i-done --ci` on Linux and macOS for every pull request, and both must pass to merge.
+- `--only NAME`, `--from NAME` and `--skip NAME` narrow a run while you iterate.
+- `bun doing-it-wrong --list` shows the project rules. Each one prints how to fix what it finds; [scripts/rules/README.md](scripts/rules/README.md) explains how to write or suppress one.
+- Inside an agent session the output goes to `build/am-i-done-<time>.txt`, and only that path is printed on failure.

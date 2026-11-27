@@ -64,7 +64,10 @@ export function parseBegin(v: unknown, now: number): number {
   const s = typeof v === "string" ? v.trim() : "";
   if (s.startsWith("+")) return now + parseDuration(s.slice(1)) * 1000;
   const t = /(Z|[+-]\d\d:?\d\d)$/i.test(s) ? Date.parse(s) : Number.NaN;
-  if (Number.isNaN(t)) throw new JobfileError(`begin must be a time with a zone, such as 2027-01-31T03:00:00Z, or a delay such as +2h; got ${JSON.stringify(v)}`);
+  if (Number.isNaN(t))
+    throw new JobfileError(
+      `begin must be a time with a zone, such as 2027-01-31T03:00:00Z, or a delay such as +2h; got ${JSON.stringify(v)}`,
+    );
   return t;
 }
 
@@ -151,7 +154,8 @@ function resources(v: unknown): Resources {
   const out: Resources = {};
   for (const [k, n] of Object.entries(v as Record<string, unknown>)) {
     if (!NAME_RE.test(k)) throw new JobfileError(`bad resource name: ${k}`);
-    if (typeof n !== "number" || !Number.isFinite(n) || n < 0) throw new JobfileError(`resource ${k} must be a number >= 0`);
+    if (typeof n !== "number" || !Number.isFinite(n) || n < 0)
+      throw new JobfileError(`resource ${k} must be a number >= 0`);
     out[k] = n;
   }
   return out;
@@ -170,7 +174,11 @@ export function parseJob(text: string, now = Date.now()): JobSpec {
   const instrs = instructions(body, bodyLine);
   // Checked before the front matter, which an unfilled argument can make unreadable.
   const arg = instrs.find((i) => i.verb === "ARG");
-  if (arg) throw new JobfileError("ARG makes this a template; add it with `cnoc template add` and start it with `cnoc template run`", arg.line);
+  if (arg)
+    throw new JobfileError(
+      "ARG makes this a template; add it with `cnoc template add` and start it with `cnoc template run`",
+      arg.line,
+    );
   let fm: Record<string, unknown>;
   try {
     fm = (YAML.parse(front) ?? {}) as Record<string, unknown>;
@@ -184,7 +192,8 @@ export function parseJob(text: string, now = Date.now()): JobSpec {
   if (typeof id !== "string" || !ID_RE.test(id) || id.length > 200)
     throw new JobfileError(`id is required and must match ${ID_RE.source}`);
   const priority = fm.priority ?? 0;
-  if (typeof priority !== "number" || !Number.isInteger(priority)) throw new JobfileError("priority must be an integer");
+  if (typeof priority !== "number" || !Number.isInteger(priority))
+    throw new JobfileError("priority must be an integer");
   const depends = stringList(fm.depends, "depends");
   if (depends.includes(id)) throw new JobfileError("a job cannot depend on itself");
   const labels: Record<string, string> = {};
@@ -224,8 +233,10 @@ export function parseJob(text: string, now = Date.now()): JobSpec {
         break;
       }
       default:
-        if (JOB_RESERVED.has(ins.verb)) throw new JobfileError(`${ins.verb} is reserved and not supported yet`, ins.line);
-        if (ADAPTER_ONLY.has(ins.verb)) throw new JobfileError(`${ins.verb} belongs in a harness adapter, not a job`, ins.line);
+        if (JOB_RESERVED.has(ins.verb))
+          throw new JobfileError(`${ins.verb} is reserved and not supported yet`, ins.line);
+        if (ADAPTER_ONLY.has(ins.verb))
+          throw new JobfileError(`${ins.verb} belongs in a harness adapter, not a job`, ins.line);
         throw new JobfileError(`unknown instruction: ${ins.verb}`, ins.line);
     }
   }
@@ -279,7 +290,10 @@ function argLines(text: string): Array<TemplateArg & { line: number }> {
 export function instantiate(text: string, set: Record<string, string>, id?: string): string {
   const args = argLines(text);
   for (const k of Object.keys(set)) {
-    if (!args.some((a) => a.name === k)) throw new JobfileError(`unknown argument ${k}; this template takes: ${args.map((a) => a.name).join(", ") || "none"}`);
+    if (!args.some((a) => a.name === k))
+      throw new JobfileError(
+        `unknown argument ${k}; this template takes: ${args.map((a) => a.name).join(", ") || "none"}`,
+      );
   }
   const values = new Map<string, string>();
   for (const a of args) {
@@ -296,17 +310,24 @@ export function instantiate(text: string, set: Record<string, string>, id?: stri
   if (id !== undefined) {
     const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
     const at = lines.findIndex((l, i) => i > 0 && i < end && /^id\s*:/.test(l));
-    if (lines[0]?.trim() !== "---" || at < 0) throw new JobfileError("a template needs front matter with its own `id:` line");
+    if (lines[0]?.trim() !== "---" || at < 0)
+      throw new JobfileError("a template needs front matter with its own `id:` line");
     lines[at] = `id: ${id}`;
   }
   return lines.join("\n").replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (whole, name: string) => values.get(name) ?? whole);
+}
+
+/** True when the text declares arguments, which makes it a template and not a job that can be submitted as it is. */
+export function declaresArgs(text: string): boolean {
+  return /^\s*ARG\s/im.test(text);
 }
 
 /** Validates a template as far as it can be without real arguments. Its id is its name. */
 export function checkTemplate(text: string): { name: string; args: TemplateArg[] } {
   const args = argLines(text).map(({ name, default: d }) => ({ name, default: d }));
   const { front } = splitFrontMatter(text);
-  if (/^id\s*:.*\$\{/m.test(front ?? "")) throw new JobfileError("a template's id is its name and cannot contain an argument");
+  if (/^id\s*:.*\$\{/m.test(front ?? ""))
+    throw new JobfileError("a template's id is its name and cannot contain an argument");
   // Arguments without a default are tried as "1", which is a valid name, count and duration.
   const trial = Object.fromEntries(args.filter((a) => a.default === null).map((a) => [a.name, "1"]));
   return { name: parseJob(instantiate(text, trial)).id, args };
@@ -330,7 +351,8 @@ function terminalStep(verb: string, rest: string, line: number): Step {
       const pattern = t[0]?.value;
       if (!pattern) throw new JobfileError("EXPECT needs a pattern", line);
       let timeout_s = 60;
-      if (t.length === 3 && t[1]?.value.toUpperCase() === "TIMEOUT") timeout_s = parseDuration(Number(t[2]?.value) || t[2]?.value);
+      if (t.length === 3 && t[1]?.value.toUpperCase() === "TIMEOUT")
+        timeout_s = parseDuration(Number(t[2]?.value) || t[2]?.value);
       else if (t.length !== 1) throw new JobfileError('EXPECT takes "pattern" [TIMEOUT n]', line);
       try {
         new RegExp(pattern);
@@ -370,7 +392,11 @@ export function shellQuote(s: string): string {
 }
 
 /** Replaces ${NAME}. Unknown names are left alone so shell variables pass through. */
-export function expand(s: string, vars: Record<string, string>, quote?: (name: string, value: string) => string): string {
+export function expand(
+  s: string,
+  vars: Record<string, string>,
+  quote?: (name: string, value: string) => string,
+): string {
   return s.replace(/\$\{([A-Z_]+)\}/g, (whole, name: string) => {
     const v = vars[name];
     if (v === undefined) return whole;

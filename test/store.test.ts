@@ -1,7 +1,8 @@
 import { beforeEach, expect, test } from "bun:test";
 import { Store, SubmitError } from "../src/server/store";
 
-const J = (id: string, depends: string[] = []) => `---\nid: ${id}\ndepends: [${depends.join(", ")}]\n---\nFROM app\nHARNESS shell\nPROMPT true\n`;
+const J = (id: string, depends: string[] = []) =>
+  `---\nid: ${id}\ndepends: [${depends.join(", ")}]\n---\nFROM app\nHARNESS shell\nPROMPT true\n`;
 let s: Store;
 beforeEach(() => {
   s = new Store(":memory:");
@@ -43,7 +44,12 @@ test("a dependent becomes ready only when its dependency is done", () => {
   expect(s.job("c")?.state).toBe("blocked");
   run("b");
   expect(s.job("c")?.state).toBe("queued");
-  expect(s.events(0).filter((e) => e.type === "job.ready").map((e) => e.job)).toEqual(["b", "c"]);
+  expect(
+    s
+      .events(0)
+      .filter((e) => e.type === "job.ready")
+      .map((e) => e.job),
+  ).toEqual(["b", "c"]);
 });
 
 test("a failed dependency leaves the dependent unstartable until a requeue succeeds", () => {
@@ -97,13 +103,21 @@ test("every mutation advances the changelog in order", () => {
   run("a");
   const ev = s.events(0);
   expect(ev.map((e) => e.seq)).toEqual(ev.map((_, i) => i + 1));
-  expect(ev.map((e) => e.type)).toEqual(["host.approved", "job.submitted", "attempt.assigned", "attempt.started", "attempt.ended", "job.terminal"]);
+  expect(ev.map((e) => e.type)).toEqual([
+    "host.approved",
+    "job.submitted",
+    "attempt.assigned",
+    "attempt.started",
+    "attempt.ended",
+    "job.terminal",
+  ]);
   expect(s.events(4).map((e) => e.type)).toEqual(["attempt.ended", "job.terminal"]);
 });
 
 // ---- overrides, priority, templates --------------------------------------------
 
-const T = (name: string, body = "PROMPT true") => `---\nid: ${name}\n---\nARG PROJECT\nARG NOTE=hi\nFROM \${PROJECT}\nHARNESS shell\n${body}\n`;
+const T = (name: string, body = "PROMPT true") =>
+  `---\nid: ${name}\n---\nARG PROJECT\nARG NOTE=hi\nFROM \${PROJECT}\nHARNESS shell\n${body}\n`;
 
 test("overrides pin a host, set priority and delay the start", () => {
   s.submit([J("a")], "t", { on: "h", priority: 7, begin: "+1h" });
@@ -119,7 +133,12 @@ test("overrides pin a host, set priority and delay the start", () => {
 test("priority can change until a job is dispatched", () => {
   s.submit([J("a"), J("b", ["a"])], "t");
   expect(s.setPriority("b", 5, "t").spec.priority).toBe(5);
-  expect(s.events(0).filter((e) => e.type === "job.priority").map((e) => e.data)).toEqual([{ from: 0, to: 5 }]);
+  expect(
+    s
+      .events(0)
+      .filter((e) => e.type === "job.priority")
+      .map((e) => e.data),
+  ).toEqual([{ from: 0, to: 5 }]);
   s.assign("a", "h");
   expect(() => s.setPriority("a", 9, "t")).toThrow(/only a job that has not been dispatched/);
   expect(() => s.setPriority("nope", 1, "t")).toThrow(/no such job/);
@@ -136,10 +155,13 @@ test("a template is added once, updated in place and found by number, name or fi
   expect(s.templateAdd(T("clean"), "/repo/templates/clean.job", "t").result).toBe("unchanged");
   const second = s.templateAdd(T("clean", "PROMPT false"), "/repo/templates/clean.job", "t");
   expect(second).toMatchObject({ result: "updated", template: { id: first.template.id } });
-  for (const ref of [String(first.template.id), "clean", "/repo/templates/clean.job"]) expect(s.template(ref)?.name).toBe("clean");
+  for (const ref of [String(first.template.id), "clean", "/repo/templates/clean.job"])
+    expect(s.template(ref)?.name).toBe("clean");
   expect(s.template("templates/clean.job", "/repo/templates/clean.job")?.name).toBe("clean");
   expect(s.template("other")).toBeNull();
-  expect(() => s.templateAdd("---\nid: x\n---\nARG lower\nFROM a\nHARNESS shell\nPROMPT true\n", null, "t")).toThrow(/ARG takes NAME/);
+  expect(() => s.templateAdd("---\nid: x\n---\nARG lower\nFROM a\nHARNESS shell\nPROMPT true\n", null, "t")).toThrow(
+    /ARG takes NAME/,
+  );
 });
 
 test("running a template submits a numbered job each time", () => {
@@ -147,7 +169,12 @@ test("running a template submits a numbered job each time", () => {
   const one = s.templateRun("clean", { PROJECT: "app" }, { on: "h" }, "t");
   const two = s.templateRun("1", { PROJECT: "app", NOTE: "again" }, {}, "t");
   expect([one.job, two.job]).toEqual(["clean/1", "clean/2"]);
-  expect(s.job("clean/1")?.spec).toMatchObject({ project: "app", requires: ["host/h"], labels: { template: "clean" }, stages: [{ prompt: "echo hi" }] });
+  expect(s.job("clean/1")?.spec).toMatchObject({
+    project: "app",
+    requires: ["host/h"],
+    labels: { template: "clean" },
+    stages: [{ prompt: "echo hi" }],
+  });
   expect(s.job("clean/2")?.spec.stages[0]?.prompt).toBe("echo again");
   expect(two.template).toMatchObject({ runs: 2, last_job: "clean/2" });
   expect(() => s.templateRun("clean", {}, {}, "t")).toThrow(/PROJECT has no default/);
@@ -166,11 +193,10 @@ test("a removed and re-added template does not reuse job ids", () => {
   const again = s.templateAdd(T("clean"), null, "t");
   expect(again.template.id).toBe(2);
   expect(s.templateRun("clean", { PROJECT: "app" }, {}, "t").job).toBe("clean/2");
-  expect(s.events(0).map((e) => e.type).filter((t) => t.startsWith("template."))).toEqual([
-    "template.added",
-    "template.run",
-    "template.removed",
-    "template.added",
-    "template.run",
-  ]);
+  expect(
+    s
+      .events(0)
+      .map((e) => e.type)
+      .filter((t) => t.startsWith("template.")),
+  ).toEqual(["template.added", "template.run", "template.removed", "template.added", "template.run"]);
 });

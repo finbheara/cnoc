@@ -7,7 +7,16 @@
  * and its result waits in an outbox until the server acknowledges it.
  */
 import { type KeyObject, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { arch, cpus, freemem, homedir, loadavg, platform, totalmem } from "node:os";
 import { join, resolve } from "node:path";
 import { type Adapter, parseAdapter } from "../jobfile";
@@ -112,7 +121,10 @@ export class CnocClient {
   }
 
   private save = (): void => {
-    this.writeJson("attempts.json", [...this.runners.values()].map((r) => r.state));
+    this.writeJson(
+      "attempts.json",
+      [...this.runners.values()].map((r) => r.state),
+    );
     this.writeJson("outbox.json", this.outbox);
   };
 
@@ -132,7 +144,8 @@ export class CnocClient {
     const names = new Set<string>();
     for (const dir of [this.opts.config.harness_dir, BUILTIN_HARNESS_DIR]) {
       if (!dir || !existsSync(expandHome(dir))) continue;
-      for (const f of readdirSync(expandHome(dir))) if (f.endsWith(".harness")) names.add(f.slice(0, -".harness".length));
+      for (const f of readdirSync(expandHome(dir)))
+        if (f.endsWith(".harness")) names.add(f.slice(0, -".harness".length));
     }
     return [...names].filter((n) => {
       try {
@@ -160,14 +173,17 @@ export class CnocClient {
       platform(),
       arch(),
       ...(this.opts.config.features ?? []),
-      ...Object.keys(this.opts.config.projects).filter((p) => this.projectPath(p)).map((p) => `project/${p}`),
+      ...Object.keys(this.opts.config.projects)
+        .filter((p) => this.projectPath(p))
+        .map((p) => `project/${p}`),
       ...this.harnesses().map((h) => `harness/${h}`),
     ];
   }
 
   private reserved(): Resources {
     const out: Resources = {};
-    for (const r of this.runners.values()) for (const [n, v] of Object.entries(r.state.spec.resources)) out[n] = (out[n] ?? 0) + v;
+    for (const r of this.runners.values())
+      for (const [n, v] of Object.entries(r.state.spec.resources)) out[n] = (out[n] ?? 0) + v;
     return out;
   }
 
@@ -193,7 +209,8 @@ export class CnocClient {
       }
       if (alive) throw new Error(`another cnoc client (pid ${other}) is already using ${this.opts.stateDir}`);
     }
-    if (CnocClient.active.has(this.opts.stateDir)) throw new Error(`another cnoc client in this process is already using ${this.opts.stateDir}`);
+    if (CnocClient.active.has(this.opts.stateDir))
+      throw new Error(`another cnoc client in this process is already using ${this.opts.stateDir}`);
     CnocClient.active.add(this.opts.stateDir);
     writeFileSync(file, String(process.pid));
   }
@@ -278,20 +295,45 @@ export class CnocClient {
   private onMessage(msg: ServerMsg): void {
     switch (msg.t) {
       case "challenge": {
-        if (msg.version !== this.version || msg.protocol !== PROTOCOL) return this.onMismatch(msg.version);
-        const sig = sign(null, Buffer.from(`cnoc-hello\n${this.opts.config.name}\n${msg.nonce}`), this.key).toString("base64");
-        this.ws?.send(JSON.stringify({ t: "hello", name: this.opts.config.name, pubkey: this.pubkey, sig, version: this.version, protocol: PROTOCOL } satisfies ClientMsg));
+        if (msg.version !== this.version || msg.protocol !== PROTOCOL) {
+          this.onMismatch(msg.version);
+          return;
+        }
+        const sig = sign(null, Buffer.from(`cnoc-hello\n${this.opts.config.name}\n${msg.nonce}`), this.key).toString(
+          "base64",
+        );
+        this.ws?.send(
+          JSON.stringify({
+            t: "hello",
+            name: this.opts.config.name,
+            pubkey: this.pubkey,
+            sig,
+            version: this.version,
+            protocol: PROTOCOL,
+          } satisfies ClientMsg),
+        );
         return;
       }
       case "pending":
         this.retryMs = Math.max(this.retryMs, 5000);
-        return this.log(`waiting for approval (key ${msg.fingerprint}). On the server: cnoc hosts approve ${this.opts.config.name}`);
+        {
+          this.log(
+            `waiting for approval (key ${msg.fingerprint}). On the server: cnoc hosts approve ${this.opts.config.name}`,
+          );
+          return;
+        }
       case "welcome":
         this.connected = true;
         this.apiToken = msg.api_token;
         this.retryMs = 500;
         this.log(`connected as ${msg.host}`);
-        this.send({ t: "sync", capacity: this.capacity(), features: this.features(), running: this.running, ended: this.outbox.map((e) => e.attempt) });
+        this.send({
+          t: "sync",
+          capacity: this.capacity(),
+          features: this.features(),
+          running: this.running,
+          ended: this.outbox.map((e) => e.attempt),
+        });
         for (const end of this.outbox) this.send({ t: "ended", ...end });
         this.heartbeat = setInterval(
           () => this.send({ t: "status", measured: this.measured(), reserved: this.reserved(), running: this.running }),
@@ -299,13 +341,20 @@ export class CnocClient {
         );
         this.send({ t: "status", measured: this.measured(), reserved: this.reserved(), running: this.running });
         return;
-      case "assign":
-        return this.onAssign(msg);
-      case "cancel":
-        return this.runners.get(msg.attempt)?.cancel(msg.reason);
+      case "assign": {
+        this.onAssign(msg);
+        return;
+      }
+      case "cancel": {
+        this.runners.get(msg.attempt)?.cancel(msg.reason);
+        return;
+      }
       case "ack":
         this.outbox = this.outbox.filter((e) => e.attempt !== msg.attempt);
-        return this.save();
+        {
+          this.save();
+          return;
+        }
     }
   }
 
@@ -314,11 +363,18 @@ export class CnocClient {
     this.ws?.close();
     this.retryMs = Math.max(this.retryMs, 5000);
     const cmd = this.opts.config.update;
-    if (!cmd) return this.log(`server is ${serverVersion}, this client is ${this.version}; no update command is configured`);
+    if (!cmd) {
+      this.log(`server is ${serverVersion}, this client is ${this.version}; no update command is configured`);
+      return;
+    }
     if (this.updating) return;
     this.updating = true;
     this.log(`server is ${serverVersion}, this client is ${this.version}; running update`);
-    const p = Bun.spawn(["sh", "-c", cmd], { env: { ...process.env, CNOC_TARGET_VERSION: serverVersion }, stdout: "inherit", stderr: "inherit" });
+    const p = Bun.spawn(["sh", "-c", cmd], {
+      env: { ...process.env, CNOC_TARGET_VERSION: serverVersion },
+      stdout: "inherit",
+      stderr: "inherit",
+    });
     void p.exited.then((code) => {
       this.updating = false;
       if (code !== 0) return this.log(`update command failed with exit ${code}; will retry`);
@@ -330,16 +386,29 @@ export class CnocClient {
   private onAssign(msg: Extract<ServerMsg, { t: "assign" }>): void {
     const { spec } = msg;
     const decline = (reason: string) => this.send({ t: "decline", attempt: msg.attempt, reason });
-    if (!this.projectPath(spec.project)) return decline(`project ${spec.project} is not on this host`);
-    for (const s of spec.stages) if (!this.adapter(s.harness)) return decline(`no adapter for harness ${s.harness}`);
+    if (!this.projectPath(spec.project)) {
+      decline(`project ${spec.project} is not on this host`);
+      return;
+    }
+    for (const s of spec.stages)
+      if (!this.adapter(s.harness)) {
+        decline(`no adapter for harness ${s.harness}`);
+        return;
+      }
     const cap = this.capacity();
     const held = this.reserved();
     for (const [n, v] of Object.entries(spec.resources)) {
-      if (n in cap && (held[n] ?? 0) + v > (cap[n] ?? 0)) return decline(`not enough ${n}`);
+      if (n in cap && (held[n] ?? 0) + v > (cap[n] ?? 0)) {
+        decline(`not enough ${n}`);
+        return;
+      }
     }
     const m = this.measured();
     const ceiling = this.opts.config.max_load;
-    if (ceiling !== undefined && m.cpus > 0 && m.load1 / m.cpus > ceiling) return decline(`load ${(m.load1 / m.cpus).toFixed(2)} is above ${ceiling}`);
+    if (ceiling !== undefined && m.cpus > 0 && m.load1 / m.cpus > ceiling) {
+      decline(`load ${(m.load1 / m.cpus).toFixed(2)} is above ${ceiling}`);
+      return;
+    }
     this.launch(
       {
         attempt: msg.attempt,
@@ -365,7 +434,8 @@ export class CnocClient {
         baseEnv: { CNOC_SOCK: this.sockPath, PATH: `${join(this.opts.stateDir, "bin")}:${process.env.PATH ?? ""}` },
         save: this.save,
         onStarted: (attempt) => this.send({ t: "started", attempt }),
-        writeLog: (attempt, stage, text) => writeFileSync(join(this.opts.stateDir, "logs", `${attempt}-${stage + 1}.log`), text),
+        writeLog: (attempt, stage, text) =>
+          writeFileSync(join(this.opts.stateDir, "logs", `${attempt}-${stage + 1}.log`), text),
         pollMs: this.opts.pollMs ?? 1000,
       },
       resuming,
@@ -375,7 +445,14 @@ export class CnocClient {
     this.log(`${resuming ? "resuming" : "starting"} attempt ${state.attempt} (${state.spec.id})`);
     void runner
       .run()
-      .catch((e): AttemptEnd => ({ attempt: state.attempt, outcome: "failed", reason: `client error: ${(e as Error).message}`, results: state.results }))
+      .catch(
+        (e): AttemptEnd => ({
+          attempt: state.attempt,
+          outcome: "failed",
+          reason: `client error: ${(e as Error).message}`,
+          results: state.results,
+        }),
+      )
       .then((end) => {
         this.runners.delete(state.attempt);
         this.outbox.push(end);
@@ -395,18 +472,25 @@ export class CnocClient {
 
     if (url.pathname === "/attempt/progress" && req.method === "POST") {
       const { note } = (await req.json()) as { note?: string };
-      this.send({ t: "progress", attempt: runner.state.attempt, stage: runner.state.stage + 1, note: String(note ?? "") });
+      this.send({
+        t: "progress",
+        attempt: runner.state.attempt,
+        stage: runner.state.stage + 1,
+        note: String(note ?? ""),
+      });
       return Response.json({ ok: true, delivered: this.connected });
     }
     if (url.pathname === "/attempt/result" && req.method === "POST") {
       const b = (await req.json()) as Partial<StageResult>;
-      if (b.status !== "done" && b.status !== "failed") return Response.json({ error: "status must be done or failed" }, { status: 400 });
+      if (b.status !== "done" && b.status !== "failed")
+        return Response.json({ error: "status must be done or failed" }, { status: 400 });
       const accepted = runner.report({ status: b.status, summary: String(b.summary ?? ""), data: b.data });
       return Response.json({ ok: true, accepted });
     }
     if (url.pathname.startsWith("/v1/")) {
       // A job may talk to the server (to submit follow-up jobs, say) without holding any credential of its own.
-      if (!this.connected || !this.apiToken) return Response.json({ error: "client is not connected to the server" }, { status: 503 });
+      if (!this.connected || !this.apiToken)
+        return Response.json({ error: "client is not connected to the server" }, { status: 503 });
       const headers = new Headers(req.headers);
       headers.set("authorization", `Bearer ${this.apiToken}`);
       headers.delete("host");

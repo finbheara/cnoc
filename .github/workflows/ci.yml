@@ -1,0 +1,43 @@
+# Runs the same gate a person and the git hooks run: `bun am-i-done --ci`.
+# Both jobs are required checks on main.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A newer push to a pull request replaces the run in progress; a run on main always finishes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    name: gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The gate has its own 10-minute deadline, which names the step that hung. This is the backstop.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two systems a client runs on.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - name: Install tmux and shellcheck
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q tmux shellcheck
+          else
+            brew install tmux shellcheck
+          fi
+      - run: bun install --frozen-lockfile
+      - run: bun am-i-done --ci

@@ -4,11 +4,21 @@
   "description": "Batch scheduling of agent harness sessions across persistent hosts",
   "license": "MIT",
   "type": "module",
+  "packageManager": "bun@1.4.5",
   "bin": { "cnoc": "src/cli.ts" },
   "scripts": {
+    "am-i-done": "bun scripts/am-i-done.ts",
+    "doing-it-wrong": "bun scripts/doing-it-wrong.ts",
     "typecheck": "bun check",
+    "lint": "bunx biome check --write .",
+    "lint:check": "bunx biome check .",
     "test": "bun test",
-    "am-i-done": "bun check && bun test"
+    "prepare": "git config core.hooksPath .git-hooks || true"
   },
-  "devDependencies": { "@types/bun": "latest" }
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/bun": "latest",
+    "typescript-5": "npm:typescript@5.9.3",
+    "zod": "^4.3.6"
+  }
 }

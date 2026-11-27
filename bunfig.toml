@@ -1,0 +1,8 @@
+[test]
+# The run cleans up after itself: reaps dead-pid temp roots at start, removes this run's at the end.
+# A test makes a throwaway directory only through scripts/testkit (rule no-raw-mkdtemp).
+preload = ["./scripts/testkit/preload.ts"]
+# Coverage counts only files in the repo, not the throwaway rule modules a spec writes to a temp directory.
+coveragePathIgnorePatterns = ["**/rule-loader-*/**"]
+# `bun test` walks every directory, .gitignore or not; a worktree under .claude/worktrees/ holds a full copy of the suite.
+pathIgnorePatterns = [".claude/worktrees/**"]

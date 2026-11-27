@@ -4,11 +4,14 @@
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "esModuleInterop": true,
     "skipLibCheck": true,
     "noEmit": true,
     "noUncheckedIndexedAccess": true,
     "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
     "types": ["bun"]
   },
-  "include": ["src", "test"]
+  "include": ["src", "test", "scripts"],
+  "exclude": ["node_modules", "scripts/rules/fixtures/**"]
 }

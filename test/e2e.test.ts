@@ -1,16 +1,24 @@
 /**
  * End to end: a real server, real clients and real tmux sessions, using the shell harness.
  */
-import { afterAll, beforeAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { specTempDir } from "../scripts/testkit";
 import { type ClientConfig, CnocClient } from "../src/client/client";
 import { Tmux } from "../src/client/tmux";
 import type { ChangeEvent } from "../src/protocol";
-import { CnocServer } from "../src/server/server";
+import { CnocServer, type HostInfo, type JobInfo } from "../src/server/server";
+import type { AttemptRow, TemplateRow } from "../src/server/store";
 
-const root = mkdtempSync(join(tmpdir(), "cnoc-"));
+// Every test here starts real tmux sessions and waits for a client and a server to agree about them,
+// so one test legitimately takes seconds. Each wait inside a test polls a condition (see `until`).
+const E2E_TEST_TIMEOUT_MS = 40_000;
+setDefaultTimeout(E2E_TEST_TIMEOUT_MS);
+/** How often `until` looks again. */
+const POLL_MS = 50;
+
+const root = specTempDir("cnoc-e2e-");
 const project = join(root, "proj");
 const socket = `cnoc-test-${process.pid}`;
 const quiet = () => {};
@@ -25,25 +33,67 @@ const config = (name: string, over: Partial<ClientConfig> = {}): ClientConfig =>
   resources: { slots: 4, solo: 1 },
   ...over,
 });
-const newClient = (name: string, over: Partial<ClientConfig> = {}, extra: { version?: string; exit?: (c: number) => void } = {}) =>
-  new CnocClient({ config: config(name, over), stateDir: join(root, `state-${name}`), tmuxSocket: socket, pollMs: 100, log: quiet, ...extra });
+const newClient = (
+  name: string,
+  over: Partial<ClientConfig> = {},
+  extra: { version?: string; exit?: (c: number) => void } = {},
+) =>
+  new CnocClient({
+    config: config(name, over),
+    stateDir: join(root, `state-${name}`),
+    tmuxSocket: socket,
+    pollMs: 100,
+    log: quiet,
+    ...extra,
+  });
 
-async function api(method: string, path: string, body?: unknown, srv: CnocServer = server): Promise<any> {
+/**
+ * Every field these tests read from a response. One route sends a few of them; a test reads only
+ * what its route sends, and an assertion on a field the route did not send fails as undefined.
+ */
+interface Res {
+  status: number;
+  error: string;
+  /** `GET /v1/jobs` lists jobs; `POST /v1/jobs` answers with id, state and created for each. */
+  jobs: Array<{ id: string; state: string; created?: boolean }>;
+  job: JobInfo;
+  host: HostInfo;
+  as_of: number;
+  attempts: AttemptRow[];
+  hosts: HostInfo[];
+  events: ChangeEvent[];
+  templates: TemplateRow[];
+  template: TemplateRow;
+  result: string;
+  subscription: { id: number; secret: string };
+}
+
+async function api(method: string, path: string, body?: unknown, srv: CnocServer = server): Promise<Res> {
   const res = await fetch(`${srv.url}${path}`, {
     method,
     headers: { authorization: `Bearer ${srv.adminToken}`, "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  return { status: res.status, ...((await res.json()) as object) };
+  return { status: res.status, ...((await res.json()) as object) } as Res;
 }
 
-async function until<T>(what: string, fn: () => Promise<T | false | null | undefined> | T | false | null | undefined, ms = 15_000): Promise<T> {
+async function firstAttempt(jobId: string): Promise<number> {
+  const [attempt] = (await api("GET", `/v1/job?id=${encodeURIComponent(jobId)}`)).attempts;
+  if (!attempt) throw new Error(`${jobId} has no attempt`);
+  return attempt.id;
+}
+
+async function until<T>(
+  what: string,
+  fn: () => Promise<T | false | null | undefined> | T | false | null | undefined,
+  ms = 15_000,
+): Promise<T> {
   const end = Date.now() + ms;
   for (;;) {
     const v = await fn();
     if (v) return v;
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
-    await Bun.sleep(50);
+    await Bun.sleep(POLL_MS);
   }
 }
 
@@ -52,7 +102,8 @@ const id = (name: string) => `t/${name}-${++seq}`;
 const job = (jobId: string, cmd: string, front = "", harnessLines?: string) =>
   `---\nid: ${jobId}\n${front}\n---\nFROM proj\n${harnessLines ?? `HARNESS shell\nPROMPT ${JSON.stringify(cmd)}`}\n`;
 const submit = (...bodies: string[]) => api("POST", "/v1/jobs", { jobs: bodies });
-const state = async (jobId: string, srv: CnocServer = server) => (await api("GET", `/v1/job?id=${encodeURIComponent(jobId)}`, undefined, srv)).job;
+const state = async (jobId: string, srv: CnocServer = server) =>
+  (await api("GET", `/v1/job?id=${encodeURIComponent(jobId)}`, undefined, srv)).job;
 const reaches = (jobId: string, want: string, srv: CnocServer = server) =>
   until(`${jobId} to be ${want}`, async () => {
     const j = await state(jobId, srv);
@@ -62,24 +113,33 @@ const events = async (): Promise<ChangeEvent[]> => (await api("GET", "/v1/events
 
 beforeAll(async () => {
   mkdirSync(project, { recursive: true });
-  server = await new CnocServer({ dataDir: join(root, "data"), port: 0, openEnrollment: true, log: quiet, declineBackoffS: 1 }).start();
+  server = await new CnocServer({
+    dataDir: join(root, "data"),
+    port: 0,
+    openEnrollment: true,
+    log: quiet,
+    declineBackoffS: 1,
+  }).start();
   client = await newClient("alpha").start();
-  await until("alpha online", async () => (await api("GET", "/v1/hosts")).hosts.find((h: any) => h.name === "alpha" && h.online));
+  await until("alpha online", async () =>
+    (await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "alpha" && h.online),
+  );
 });
 
 afterAll(async () => {
   await client.stop();
   await server.stop();
   await new Tmux(socket).killServer();
-  rmSync(root, { recursive: true, force: true });
+  // tmux leaves its socket file behind when the server is told to exit; it is outside the test's temp directory.
+  rmSync(join(process.env.TMUX_TMPDIR ?? "/tmp", `tmux-${process.getuid?.() ?? 0}`, socket), { force: true });
 });
 
 test("the host reports its resources, projects and harnesses", async () => {
-  const host = (await api("GET", "/v1/hosts")).hosts.find((h: any) => h.name === "alpha");
-  expect(host.capacity).toEqual({ slots: 4, solo: 1 });
-  expect(host.features).toContain("project/proj");
-  expect(host.features).toContain("harness/shell");
-  expect(host.measured.cpus).toBeGreaterThan(0);
+  const host = (await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "alpha");
+  expect(host?.capacity).toEqual({ slots: 4, solo: 1 });
+  expect(host?.features).toContain("project/proj");
+  expect(host?.features).toContain("harness/shell");
+  expect(host?.measured?.cpus).toBeGreaterThan(0);
 });
 
 test("a dependency chain runs in order", async () => {
@@ -95,7 +155,7 @@ test("a dependency chain runs in order", async () => {
   const at = (type: string, jobId: string) => ev.findIndex((e) => e.type === type && e.job === jobId);
   expect(at("job.terminal", a)).toBeLessThan(at("job.ready", b));
   expect(at("job.ready", b)).toBeLessThan(at("attempt.started", b));
-}, 30_000);
+});
 
 test("a failing command fails the job and its dependent cannot start", async () => {
   const [a, b] = [id("bad"), id("after-bad")];
@@ -107,11 +167,18 @@ test("a failing command fails the job and its dependent cannot start", async () 
     return j.reason ? j : false;
   });
   expect(waiting).toMatchObject({ state: "blocked", reason: `dependency-not-done: ${a}` });
-}, 30_000);
+});
 
 test("stages run in order and each reports a result", async () => {
   const j = id("stages");
-  await submit(job(j, "", "", 'HARNESS shell\nPROMPT "cnoc progress halfway; cnoc done \\"built it\\""\nPROMPT "test \\"$CNOC_STAGE\\" = 2"'));
+  await submit(
+    job(
+      j,
+      "",
+      "",
+      'HARNESS shell\nPROMPT "cnoc progress halfway; cnoc done \\"built it\\""\nPROMPT "test \\"$CNOC_STAGE\\" = 2"',
+    ),
+  );
   const done = await reaches(j, "done");
   expect(done.result).toEqual([
     { status: "done", summary: "built it" },
@@ -119,7 +186,7 @@ test("stages run in order and each reports a result", async () => {
   ]);
   const progress = (await events()).find((e) => e.type === "attempt.progress" && e.job === j);
   expect(progress?.data).toEqual({ stage: 1, note: "halfway" });
-}, 30_000);
+});
 
 test("a counted resource limits how many run at once", async () => {
   const [a, b] = [id("solo"), id("solo")];
@@ -131,7 +198,7 @@ test("a counted resource limits how many run at once", async () => {
   const started = ev.findIndex((e) => e.type === "attempt.assigned" && e.job === b);
   expect(ended).toBeGreaterThan(-1);
   expect(started).toBeGreaterThan(ended);
-}, 30_000);
+});
 
 test("a job no host can run says why", async () => {
   const j = id("nowhere");
@@ -149,19 +216,19 @@ test("cancelling a running job stops its session", async () => {
   const j = id("cancel");
   await submit(job(j, "sleep 60"));
   await reaches(j, "running");
-  const attempt = (await api("GET", `/v1/job?id=${encodeURIComponent(j)}`)).attempts[0].id;
+  const attempt = await firstAttempt(j);
   expect(await new Tmux(socket).sessions()).toContain(`cnoc-${attempt}-0`);
   await api("POST", `/v1/job/cancel?id=${encodeURIComponent(j)}`);
   await reaches(j, "cancelled");
   expect(await new Tmux(socket).sessions()).not.toContain(`cnoc-${attempt}-0`);
   expect(existsSync(join(root, "state-alpha", "logs", `${attempt}-1.log`))).toBe(true);
-}, 30_000);
+});
 
 test("the time limit ends a job that runs too long", async () => {
   const j = id("slow");
   await submit(job(j, "sleep 60", "time: 1s"));
   expect((await reaches(j, "failed")).reason).toBe("timeout");
-}, 30_000);
+});
 
 test("a job can submit a follow-up job through the client without credentials", async () => {
   const [parent, child] = [id("planner"), id("planned")];
@@ -172,19 +239,21 @@ test("a job can submit a follow-up job through the client without credentials", 
   expect(existsSync(join(project, "planned.txt"))).toBe(true);
   const submitted = (await events()).find((e) => e.type === "job.submitted" && e.job === child);
   expect(submitted?.actor).toBe("host:alpha");
-}, 30_000);
+});
 
 test("a restarted client picks its running session back up", async () => {
   const j = id("survivor");
   await submit(job(j, "sleep 2; cnoc done survived"));
   await reaches(j, "running");
   await client.stop();
-  await until("alpha offline", async () => (await api("GET", "/v1/hosts")).hosts.find((h: any) => h.name === "alpha" && !h.online));
+  await until("alpha offline", async () =>
+    (await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "alpha" && !h.online),
+  );
   expect((await state(j)).state).toBe("running");
   client = await newClient("alpha").start();
   const done = await reaches(j, "done");
   expect(done.result).toEqual([{ status: "done", summary: "survived" }]);
-}, 30_000);
+});
 
 test("work finished while the server was down is reported when it returns", async () => {
   const dir = join(root, "data-restart");
@@ -200,7 +269,12 @@ test("work finished while the server was down is reported when it returns", asyn
   try {
     const j = id("outlives-server");
     const queued = id("waits-for-server");
-    await api("POST", "/v1/jobs", { jobs: [job(j, "sleep 1.5; cnoc done finished-offline"), job(queued, "true", `depends: [${j}]`)] }, srv);
+    await api(
+      "POST",
+      "/v1/jobs",
+      { jobs: [job(j, "sleep 1.5; cnoc done finished-offline"), job(queued, "true", `depends: [${j}]`)] },
+      srv,
+    );
     await reaches(j, "running", srv);
     await srv.stop();
     await until("the session to finish with no server", () => beta.running.length === 0, 10_000);
@@ -213,18 +287,18 @@ test("work finished while the server was down is reported when it returns", asyn
     await beta.stop();
     await srv.stop();
   }
-}, 40_000);
+});
 
 test("a host that lost a session while away is reconciled", async () => {
   const j = id("vanished");
   await submit(job(j, "sleep 60"));
   await reaches(j, "running");
-  const attempt = (await api("GET", `/v1/job?id=${encodeURIComponent(j)}`)).attempts[0].id;
+  const attempt = await firstAttempt(j);
   await client.stop();
   await new Tmux(socket).kill(`cnoc-${attempt}-0`);
   client = await newClient("alpha").start();
   expect((await reaches(j, "failed")).reason).toBe("no-result (session-lost)");
-}, 30_000);
+});
 
 test("an unknown host waits for approval", async () => {
   const strict = await new CnocServer({ dataDir: join(root, "data-strict"), port: 0, log: quiet }).start();
@@ -236,26 +310,35 @@ test("an unknown host waits for approval", async () => {
   }).start();
   try {
     const hosts = async () => (await api("GET", "/v1/hosts", undefined, strict)).hosts;
-    const pending = await until("gamma pending", async () => (await hosts()).find((h: any) => h.name === "gamma"));
+    const pending = await until("gamma pending", async () => (await hosts()).find((h) => h.name === "gamma"));
     expect(pending).toMatchObject({ status: "pending", online: false });
     expect((await api("POST", "/v1/host/approve?name=gamma", undefined, strict)).host.status).toBe("approved");
-    await until("gamma online", async () => (await hosts()).find((h: any) => h.name === "gamma" && h.online), 20_000);
+    await until("gamma online", async () => (await hosts()).find((h) => h.name === "gamma" && h.online), 20_000);
   } finally {
     await gamma.stop();
     await strict.stop();
   }
-}, 30_000);
+});
 
 test("a client on the wrong version updates itself and takes no work", async () => {
   const marker = join(root, "updated.txt");
   let exitCode = -1;
-  const old = newClient("delta", { update: `echo "$CNOC_TARGET_VERSION" > ${marker}` }, { version: "0.0.1-old", exit: (c) => (exitCode = c) });
+  const old = newClient(
+    "delta",
+    { update: `echo "$CNOC_TARGET_VERSION" > ${marker}` },
+    {
+      version: "0.0.1-old",
+      exit: (c) => {
+        exitCode = c;
+      },
+    },
+  );
   await old.start();
   await until("update command to run and the client to exit", () => exitCode !== -1);
   expect(exitCode).toBe(75);
   expect(readFileSync(marker, "utf8").trim()).toBe(server.version);
-  expect((await api("GET", "/v1/hosts")).hosts.find((h: any) => h.name === "delta")).toBeUndefined();
-}, 30_000);
+  expect((await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "delta")).toBeUndefined();
+});
 
 test("a second client cannot share a state directory", async () => {
   await expect(newClient("alpha").start()).rejects.toThrow(/already using/);
@@ -263,7 +346,7 @@ test("a second client cannot share a state directory", async () => {
   const j = id("still-fine");
   await submit(job(j, "true"));
   await reaches(j, "done");
-}, 30_000);
+});
 
 test("a webhook subscriber receives signed events in order", async () => {
   const got: Array<{ seq: number; type: string; job: string; sig: string; body: string }> = [];
@@ -281,28 +364,40 @@ test("a webhook subscriber receives signed events in order", async () => {
     },
   });
   try {
-    const sub = (await api("POST", "/v1/subscriptions", { url: `http://127.0.0.1:${hook.port}/`, types: ["job.submitted", "job.terminal"], secret: "s3cret" })).subscription;
+    const sub = (
+      await api("POST", "/v1/subscriptions", {
+        url: `http://127.0.0.1:${hook.port}/`,
+        types: ["job.submitted", "job.terminal"],
+        secret: "s3cret",
+      })
+    ).subscription;
     const j = id("hooked");
     await submit(job(j, "true"));
     await until("both deliveries", () => got.filter((e) => e.job === j).length === 2);
     const mine = got.filter((e) => e.job === j);
     expect(mine.map((e) => e.type)).toEqual(["job.submitted", "job.terminal"]);
-    expect(mine[0]!.seq).toBeLessThan(mine[1]!.seq);
-    const hmac = new Bun.CryptoHasher("sha256", "s3cret").update(mine[0]!.body).digest("hex");
-    expect(mine[0]!.sig).toBe(`sha256=${hmac}`);
+    const [first, second] = mine;
+    if (!first || !second) throw new Error("expected two deliveries");
+    expect(first.seq).toBeLessThan(second.seq);
+    const hmac = new Bun.CryptoHasher("sha256", "s3cret").update(first.body).digest("hex");
+    expect(first.sig).toBe(`sha256=${hmac}`);
     await api("DELETE", `/v1/subscriptions?id=${sub.id}`);
   } finally {
     await hook.stop(true);
   }
-}, 30_000);
+});
 
 test("the event stream replays from a sequence number and then follows", async () => {
   const from = (await api("GET", "/v1/jobs")).as_of;
   const ctl = new AbortController();
-  const res = await fetch(`${server.url}/v1/events/stream?after=${from}`, { headers: { authorization: `Bearer ${server.adminToken}` }, signal: ctl.signal });
+  const res = await fetch(`${server.url}/v1/events/stream?after=${from}`, {
+    headers: { authorization: `Bearer ${server.adminToken}` },
+    signal: ctl.signal,
+  });
   const j = id("streamed");
   await submit(job(j, "true"));
-  const reader = res.body!.getReader();
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("the stream has no body");
   let text = "";
   await until("terminal event on the stream", async () => {
     const { value } = await reader.read();
@@ -314,7 +409,7 @@ test("the event stream replays from a sequence number and then follows", async (
   expect(seqs[0]).toBe(from + 1);
   expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
   expect(text).toContain(`"job":"${j}"`);
-}, 30_000);
+});
 
 test("a drained host takes no new work until it is undrained", async () => {
   await api("POST", "/v1/host/drain?name=alpha&on=1");
@@ -327,7 +422,7 @@ test("a drained host takes no new work until it is undrained", async () => {
   expect(waiting).toMatchObject({ state: "queued", pending_reason: "no-eligible-host" });
   await api("POST", "/v1/host/drain?name=alpha&on=0");
   await reaches(j, "done");
-}, 30_000);
+});
 
 test("a failed job can be requeued and run again", async () => {
   const j = id("retry");
@@ -338,27 +433,47 @@ test("a failed job can be requeued and run again", async () => {
   expect((await api("POST", `/v1/job/requeue?id=${encodeURIComponent(j)}`)).job.state).toBe("queued");
   await reaches(j, "done");
   expect((await api("GET", `/v1/job?id=${encodeURIComponent(j)}`)).attempts.length).toBe(2);
-}, 30_000);
+});
 
 test("a job on an unreachable host can be abandoned, and the host is told to stop it when it returns", async () => {
   const j = id("abandoned");
   await submit(job(j, "sleep 60"));
   await reaches(j, "running");
-  const attempt = (await api("GET", `/v1/job?id=${encodeURIComponent(j)}`)).attempts[0].id;
+  const attempt = await firstAttempt(j);
   expect((await api("POST", `/v1/job/abandon?id=${encodeURIComponent(j)}`)).status).toBe(409);
   await client.stop();
-  await until("alpha offline", async () => (await api("GET", "/v1/hosts")).hosts.find((h: any) => h.name === "alpha" && !h.online));
-  expect((await api("POST", `/v1/job/abandon?id=${encodeURIComponent(j)}`)).job).toMatchObject({ state: "failed", reason: "abandoned" });
+  await until("alpha offline", async () =>
+    (await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "alpha" && !h.online),
+  );
+  expect((await api("POST", `/v1/job/abandon?id=${encodeURIComponent(j)}`)).job).toMatchObject({
+    state: "failed",
+    reason: "abandoned",
+  });
   client = await newClient("alpha").start();
-  await until("the orphaned session to be stopped", async () => !(await new Tmux(socket).sessions()).includes(`cnoc-${attempt}-0`));
+  await until(
+    "the orphaned session to be stopped",
+    async () => !(await new Tmux(socket).sessions()).includes(`cnoc-${attempt}-0`),
+  );
   expect((await state(j)).state).toBe("failed");
-}, 30_000);
+});
 
 test("a custom placement policy is loaded from a file", async () => {
   const file = join(root, "policy.ts");
   writeFileSync(file, 'export default { filter: (job) => (job.id.includes("banned") ? "policy says no" : null) };\n');
-  const srv = await new CnocServer({ dataDir: join(root, "data-policy"), port: 0, openEnrollment: true, log: quiet, policy: file }).start();
-  const eps = await new CnocClient({ config: { server: srv.url, name: "eps", projects: { proj: project } }, stateDir: join(root, "state-eps"), tmuxSocket: socket, pollMs: 100, log: quiet }).start();
+  const srv = await new CnocServer({
+    dataDir: join(root, "data-policy"),
+    port: 0,
+    openEnrollment: true,
+    log: quiet,
+    policy: file,
+  }).start();
+  const eps = await new CnocClient({
+    config: { server: srv.url, name: "eps", projects: { proj: project } },
+    stateDir: join(root, "state-eps"),
+    tmuxSocket: socket,
+    pollMs: 100,
+    log: quiet,
+  }).start();
   try {
     const [ok, banned] = [id("allowed"), id("banned")];
     await api("POST", "/v1/jobs", { jobs: [job(banned, "true"), job(ok, "true")] }, srv);
@@ -368,7 +483,7 @@ test("a custom placement policy is loaded from a file", async () => {
     await eps.stop();
     await srv.stop();
   }
-}, 30_000);
+});
 
 test("requests without a valid token are refused", async () => {
   const res = await fetch(`${server.url}/v1/jobs`, { headers: { authorization: "Bearer nope" } });
@@ -381,17 +496,37 @@ test("a template runs again and again, with arguments, pinned to a host", async 
   const text = `---\nid: ${name}\n---\nARG WORD\nARG FILE=tpl.txt\nFROM proj\nHARNESS shell\nPROMPT "echo \${WORD} >> \${FILE}; cnoc done \\"wrote \${WORD} as $USER\\""\n`;
   const pin = await newClient("pin", { features: ["host/alpha"] }).start();
   try {
-    await until("pin online", async () => (await api("GET", "/v1/hosts")).hosts.find((h: any) => h.name === "pin" && h.online));
+    await until("pin online", async () =>
+      (await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "pin" && h.online),
+    );
     // A host cannot claim to be another one.
     const hosts = (await api("GET", "/v1/hosts")).hosts;
-    expect(hosts.find((h: any) => h.name === "pin").features.filter((f: string) => f.startsWith("host/"))).toEqual(["host/pin"]);
+    expect(hosts.find((h) => h.name === "pin")?.features.filter((f: string) => f.startsWith("host/"))).toEqual([
+      "host/pin",
+    ]);
 
     const added = await api("POST", "/v1/templates", { text, source: "/somewhere/tpl.job" });
-    expect(added).toMatchObject({ status: 200, result: "added", template: { name, args: [{ name: "WORD", default: null }, { name: "FILE", default: "tpl.txt" }] } });
-    expect((await api("GET", "/v1/templates")).templates.map((t: any) => t.name)).toContain(name);
+    expect(added).toMatchObject({
+      status: 200,
+      result: "added",
+      template: {
+        name,
+        args: [
+          { name: "WORD", default: null },
+          { name: "FILE", default: "tpl.txt" },
+        ],
+      },
+    });
+    expect((await api("GET", "/v1/templates")).templates.map((t) => t.name)).toContain(name);
 
     const runs = [];
-    for (const word of ["one", "two", "three"]) runs.push(await api("POST", `/v1/template/run?ref=${added.template.id}`, { set: { WORD: word }, overrides: { on: "pin" } }));
+    for (const word of ["one", "two", "three"])
+      runs.push(
+        await api("POST", `/v1/template/run?ref=${added.template.id}`, {
+          set: { WORD: word },
+          overrides: { on: "pin" },
+        }),
+      );
     expect(runs.map((r) => r.job.id)).toEqual([`${name}/1`, `${name}/2`, `${name}/3`]);
     for (const r of runs) {
       const done = await reaches(r.job.id, "done");
@@ -399,18 +534,30 @@ test("a template runs again and again, with arguments, pinned to a host", async 
       expect(done.labels).toEqual({ template: name });
     }
     const ev = await events();
-    expect(ev.filter((e) => e.type === "attempt.started" && e.job?.startsWith(`${name}/`)).map((e) => e.host)).toEqual(["pin", "pin", "pin"]);
-    expect(readFileSync(join(project, "tpl.txt"), "utf8").split("\n").filter(Boolean).sort()).toEqual(["one", "three", "two"]);
-    expect((await state(`${name}/1`)).result[0].summary).toMatch(/^wrote one as \S+$/);
+    expect(ev.filter((e) => e.type === "attempt.started" && e.job?.startsWith(`${name}/`)).map((e) => e.host)).toEqual([
+      "pin",
+      "pin",
+      "pin",
+    ]);
+    expect(readFileSync(join(project, "tpl.txt"), "utf8").split("\n").filter(Boolean).sort()).toEqual([
+      "one",
+      "three",
+      "two",
+    ]);
+    expect((await state(`${name}/1`)).result?.[0]?.summary).toMatch(/^wrote one as \S+$/);
 
     expect((await api("POST", `/v1/template/run?ref=${name}`, { set: {} })).error).toMatch(/WORD has no default/);
-    expect((await api("POST", `/v1/template/run?ref=${name}`, { set: { WORD: "x" }, overrides: { on: "nowhere" } })).status).toBe(404);
-    expect((await api("DELETE", `/v1/template?ref=tpl.job&path=${encodeURIComponent("/somewhere/tpl.job")}`)).template.name).toBe(name);
+    expect(
+      (await api("POST", `/v1/template/run?ref=${name}`, { set: { WORD: "x" }, overrides: { on: "nowhere" } })).status,
+    ).toBe(404);
+    expect(
+      (await api("DELETE", `/v1/template?ref=tpl.job&path=${encodeURIComponent("/somewhere/tpl.job")}`)).template.name,
+    ).toBe(name);
     expect((await api("GET", `/v1/template?ref=${name}`)).status).toBe(404);
   } finally {
     await pin.stop();
   }
-}, 40_000);
+});
 
 test("a job with a begin time waits for it", async () => {
   const j = id("later");
@@ -421,11 +568,11 @@ test("a job with a begin time waits for it", async () => {
     const s = await state(j);
     return s.pending_reason === "scheduled" ? s : false;
   });
-  expect(waiting.begin_at).toBeGreaterThan(submitted + 2000);
+  expect(waiting.begin_at ?? 0).toBeGreaterThan(submitted + 2000);
   await reaches(j, "done");
   const started = (await events()).find((e) => e.type === "attempt.started" && e.job === j);
-  expect(started?.ts).toBeGreaterThanOrEqual(waiting.begin_at);
-}, 30_000);
+  expect(started?.ts).toBeGreaterThanOrEqual(waiting.begin_at ?? Number.POSITIVE_INFINITY);
+});
 
 test("raising a queued job's priority moves it ahead; a running job is not interrupted", async () => {
   const [holder, plain, urgent] = [id("holder"), id("plain"), id("urgent")];
@@ -443,4 +590,4 @@ test("raising a queued job's priority moves it ahead; a running job is not inter
   expect(startedAt(holder)).toBeLessThan(startedAt(urgent));
   expect(startedAt(urgent)).toBeLessThan(startedAt(plain));
   expect(ev.find((e) => e.type === "job.terminal" && e.job === holder)?.data).toMatchObject({ state: "done" });
-}, 30_000);
+});
