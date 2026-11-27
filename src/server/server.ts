@@ -472,6 +472,8 @@ export class CnocServer {
     const reserved = this.store.reserved();
     return this.store.hosts().map((h) => ({
       ...h,
+      // An online host passed the version check at hello; the stored value is only written at its sync.
+      version: this.online.has(h.name) ? this.version : h.version,
       fingerprint: fingerprint(h.pubkey),
       online: this.online.has(h.name),
       reserved: reserved.get(h.name) ?? {},

@@ -188,6 +188,39 @@ async function rawHello(srv: CnocServer, name: string, key: KeyObject, fields: {
   await closed;
 }
 
+test("a host that has said hello but not yet synced is shown on the server's version", async () => {
+  // The stored version is written at sync. Between hello and sync the host is already online, and
+  // a reader of /v1/hosts must not see the version it had before it updated.
+  const srv = await new CnocServer({
+    dataDir: join(root, "data-presync"),
+    port: 0,
+    openEnrollment: true,
+    log: quiet,
+    version: "v-now",
+  }).start();
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const ws = new WebSocket(`${srv.url.replace(/^http/, "ws")}/v1/client`);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      ws.onclose = () => reject(new Error("closed before welcome"));
+      ws.onmessage = (ev) => {
+        const msg = JSON.parse(String(ev.data)) as { t: string; nonce?: string };
+        if (msg.t === "welcome") return resolve();
+        if (msg.t !== "challenge") return;
+        const pubkey = createPublicKey(privateKey).export({ type: "spki", format: "der" }).toString("base64");
+        const sig = sign(null, Buffer.from(`cnoc-hello\niota\n${msg.nonce}`), privateKey).toString("base64");
+        ws.send(JSON.stringify({ t: "hello", name: "iota", pubkey, sig, protocol: PROTOCOL, version: "v-now" }));
+      };
+    });
+    const shown = (await api("GET", "/v1/hosts", undefined, srv)).hosts.find((h) => h.name === "iota");
+    expect(shown).toMatchObject({ online: true, version: "v-now", mismatch: null });
+  } finally {
+    ws.onclose = null;
+    ws.close();
+    await srv.stop();
+  }
+});
+
 test("what a host on another version says is shown only for an approved key, and only as plain text", async () => {
   const strict = await new CnocServer({ dataDir: join(root, "data-notes"), port: 0, log: quiet }).start();
   try {
