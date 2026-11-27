@@ -4,6 +4,5 @@
   "projects": { "myapp": "~/github/myapp" },
   "resources": { "slots": 3, "gpu": 1 },
   "features": ["zfs"],
-  "max_load": 0.9,
-  "update": "git -C ~/.local/share/cnoc/app pull -q --ff-only && bun install --cwd ~/.local/share/cnoc/app --frozen-lockfile --production"
+  "max_load": 0.9
 }

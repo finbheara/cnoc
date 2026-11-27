@@ -22,6 +22,8 @@ const root = specTempDir("cnoc-e2e-");
 const project = join(root, "proj");
 const socket = `cnoc-test-${process.pid}`;
 const quiet = () => {};
+/** Every test client's checkout unless it brings its own: not a git checkout, so a test that gets the versions wrong can never move this repository. */
+const noCheckout = join(root, "not-a-checkout");
 let server: CnocServer;
 let client: CnocClient;
 let seq = 0;
@@ -44,6 +46,7 @@ const newClient = (
     tmuxSocket: socket,
     pollMs: 100,
     log: quiet,
+    checkout: noCheckout,
     ...extra,
   });
 
@@ -268,6 +271,7 @@ test("work finished while the server was down is reported when it returns", asyn
     tmuxSocket: socket,
     pollMs: 100,
     log: quiet,
+    checkout: noCheckout,
   }).start();
   try {
     const j = id("outlives-server");
@@ -310,6 +314,7 @@ test("an unknown host waits for approval", async () => {
     stateDir: join(root, "state-gamma"),
     tmuxSocket: socket,
     log: quiet,
+    checkout: noCheckout,
   }).start();
   try {
     const hosts = async () => (await api("GET", "/v1/hosts", undefined, strict)).hosts;
@@ -340,7 +345,10 @@ test("a client on the wrong version updates itself and takes no work", async () 
   await until("update command to run and the client to exit", () => exitCode !== -1);
   expect(exitCode).toBe(75);
   expect(readFileSync(marker, "utf8").trim()).toBe(server.version);
-  expect((await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "delta")).toBeUndefined();
+  // The server knows the host by its signed hello, shows what it runs, and gave it nothing.
+  const delta = (await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "delta");
+  expect(delta).toMatchObject({ online: false, running: [], mismatch: { version: "0.0.1-old" } });
+  expect(delta?.mismatch?.note).toMatch(/^updating to /);
 });
 
 test("a second client cannot share a state directory", async () => {
@@ -476,6 +484,7 @@ test("a custom placement policy is loaded from a file", async () => {
     tmuxSocket: socket,
     pollMs: 100,
     log: quiet,
+    checkout: noCheckout,
   }).start();
   try {
     const [ok, banned] = [id("allowed"), id("banned")];

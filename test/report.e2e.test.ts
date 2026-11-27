@@ -80,6 +80,8 @@ beforeAll(async () => {
     tmuxSocket: socket,
     pollMs: 100,
     log: quiet,
+    // Not a git checkout: a test that gets the versions wrong can never move this repository.
+    checkout: join(root, "not-a-checkout"),
   }).start();
   await until("alpha online", async () =>
     (await api("GET", "/v1/hosts")).hosts.find((h) => h.name === "alpha" && h.online),

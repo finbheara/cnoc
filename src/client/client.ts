@@ -21,11 +21,13 @@ import { arch, cpus, freemem, homedir, loadavg, platform, totalmem } from "node:
 import { join, resolve } from "node:path";
 import { type Adapter, parseAdapter } from "../jobfile";
 import type { AttemptEnd, ClientMsg, Measured, Resources, ServerMsg } from "../protocol";
-import { PROTOCOL, VERSION } from "../protocol";
+import { PROTOCOL } from "../protocol";
 import { readResult, wrongStage } from "../report";
 import { cleanUsage } from "../usage";
+import { APP_ROOT, runningVersion, runningVersionProblem } from "../version";
 import { AttemptRunner, type AttemptState } from "./runner";
 import { Tmux } from "./tmux";
+import { Updater } from "./update";
 
 export interface ClientConfig {
   /** http(s)://host:port of the server. */
@@ -40,7 +42,10 @@ export interface ClientConfig {
   max_load?: number;
   /** Extra directory of <name>.harness adapters, searched before the built-in ones. */
   harness_dir?: string;
-  /** Shell command run when the server's version differs. The client exits afterwards so its service restarts it. */
+  /**
+   * Shell command run instead of the built-in update when the server's version differs, with
+   * `CNOC_TARGET_VERSION` set. For installs that are not a git checkout. See client/update.ts.
+   */
   update?: string;
 }
 
@@ -49,6 +54,8 @@ export interface ClientOptions {
   stateDir: string;
   tmuxSocket?: string;
   version?: string;
+  /** The checkout the built-in update moves. Default: the one this code runs from. */
+  checkout?: string;
   pollMs?: number;
   /** Replaces process.exit after an update, for tests. */
   exit?: (code: number) => void;
@@ -59,6 +66,8 @@ const BUILTIN_HARNESS_DIR = resolve(import.meta.dir, "../../harness");
 const CLI_ENTRY = resolve(import.meta.dir, "../cli.ts");
 /** WebSocket close code the server uses when a newer connection takes over a host's identity. */
 export const REPLACED = 4001;
+/** While an update waits out its backoff, the server is still asked this often whether its version changed. */
+const MISMATCH_RECHECK_MS = 5 * 60_000;
 const expandHome = (p: string): string => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 
 export class CnocClient {
@@ -69,7 +78,6 @@ export class CnocClient {
   private ws: WebSocket | null = null;
   private connected = false;
   private stopped = false;
-  private updating = false;
   private apiToken: string | null = null;
   private retryMs = 500;
   private timers = new Set<Timer>();
@@ -80,14 +88,24 @@ export class CnocClient {
   private key: KeyObject;
   private pubkey: string;
   private log: (line: string) => void;
+  private updater: Updater;
 
   constructor(private opts: ClientOptions) {
     const dir = opts.stateDir;
     mkdirSync(join(dir, "logs"), { recursive: true });
     mkdirSync(join(dir, "bin"), { recursive: true });
     chmodSync(dir, 0o700);
-    this.version = opts.version ?? VERSION;
+    this.version = opts.version ?? runningVersion();
     this.log = opts.log ?? ((l) => console.log(`[client ${opts.config.name}] ${l}`));
+    const problem = opts.version === undefined ? runningVersionProblem() : null;
+    if (problem) this.log(`WARNING: ${problem}`);
+    this.updater = new Updater({
+      checkout: opts.checkout ?? APP_ROOT,
+      stateDir: dir,
+      version: this.version,
+      command: opts.config.update,
+      log: this.log,
+    });
     this.tmux = new Tmux(opts.tmuxSocket ?? "cnoc");
     this.sockPath = join(dir, "sock");
 
@@ -297,10 +315,7 @@ export class CnocClient {
   private onMessage(msg: ServerMsg): void {
     switch (msg.t) {
       case "challenge": {
-        if (msg.version !== this.version || msg.protocol !== PROTOCOL) {
-          this.onMismatch(msg.version);
-          return;
-        }
+        const mismatch = msg.version !== this.version || msg.protocol !== PROTOCOL;
         const sig = sign(null, Buffer.from(`cnoc-hello\n${this.opts.config.name}\n${msg.nonce}`), this.key).toString(
           "base64",
         );
@@ -312,8 +327,11 @@ export class CnocClient {
             sig,
             version: this.version,
             protocol: PROTOCOL,
+            // The server will refuse it, but can show the host's version and why it has not caught up.
+            ...(mismatch ? { update: this.updater.note(msg.version) } : {}),
           } satisfies ClientMsg),
         );
+        if (mismatch) this.onMismatch(msg.version);
         return;
       }
       case "pending":
@@ -328,6 +346,7 @@ export class CnocClient {
         this.connected = true;
         this.apiToken = msg.api_token;
         this.retryMs = 500;
+        this.updater.clear();
         this.log(`connected as ${msg.host}`);
         this.send({
           t: "sync",
@@ -360,29 +379,23 @@ export class CnocClient {
     }
   }
 
-  /** The server runs a different version: update before taking any work. */
+  /**
+   * The server runs a different version: take no work, update to it, and exit so the service
+   * manager starts the new code. Between tries the server is asked again only when one is due.
+   */
   private onMismatch(serverVersion: string): void {
     this.ws?.close();
-    this.retryMs = Math.max(this.retryMs, 5000);
-    const cmd = this.opts.config.update;
-    if (!cmd) {
-      this.log(`server is ${serverVersion}, this client is ${this.version}; no update command is configured`);
-      return;
-    }
-    if (this.updating) return;
-    this.updating = true;
-    this.log(`server is ${serverVersion}, this client is ${this.version}; running update`);
-    const p = Bun.spawn(["sh", "-c", cmd], {
-      env: { ...process.env, CNOC_TARGET_VERSION: serverVersion },
-      stdout: "inherit",
-      stderr: "inherit",
-    });
-    void p.exited.then((code) => {
-      this.updating = false;
-      if (code !== 0) return this.log(`update command failed with exit ${code}; will retry`);
-      this.log("updated; exiting so the service manager starts the new version");
-      void this.stop().then(() => (this.opts.exit ?? process.exit)(75));
-    });
+    const wait = this.updater.dueIn(serverVersion);
+    this.retryMs = Math.max(this.retryMs, Math.min(Math.max(wait, 5000), MISMATCH_RECHECK_MS));
+    if (wait > 0) return;
+    void this.updater
+      .attempt(serverVersion)
+      .then(async (restart) => {
+        if (!restart) return;
+        await this.stop();
+        (this.opts.exit ?? process.exit)(75);
+      })
+      .catch((e: Error) => this.log(`update failed: ${e.message}`));
   }
 
   private onAssign(msg: Extract<ServerMsg, { t: "assign" }>): void {

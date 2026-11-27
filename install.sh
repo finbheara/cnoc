@@ -18,7 +18,8 @@ cnoc client installer
   --name NAME           this host's name on the server (default: short hostname)
   --project NAME=PATH   a project this host has checked out; repeat for more
   --resource NAME=N     a resource this host offers; repeat for more (default: slots=1)
-  --ref REF             branch or tag of cnoc to install (default: main)
+  --ref REF             branch or tag of cnoc to install first (default: main). Once connected,
+                        the client follows the server's commit, whatever REF was
   --force               overwrite an existing client config
   --no-service          install only; do not create or start a service
   --uninstall           stop the service and remove the code; config and host key are kept
@@ -139,7 +140,6 @@ main() {
     CNOC_I_SERVER=$server CNOC_I_NAME=$name CNOC_I_OUT=$CONFIG \
       CNOC_I_PROJECTS=$(printf '%s\n' ${projects[@]+"${projects[@]}"}) \
       CNOC_I_RESOURCES=$(printf '%s\n' "${resources[@]}") \
-      CNOC_I_UPDATE="git -C '$APP' pull -q --ff-only && '$bun' install --cwd '$APP' --frozen-lockfile --production" \
       "$bun" -e '
         const { existsSync, writeFileSync } = require("node:fs");
         const pairs = (s) => (s || "").split("\n").filter(Boolean).map((l) => {
@@ -155,11 +155,25 @@ main() {
           if (!/^\d+$/.test(v)) { console.error(`error: resource ${n}: "${v}" is not a count`); process.exit(1); }
           return [n, Number(v)];
         }));
-        writeFileSync(e.CNOC_I_OUT, JSON.stringify({ server: e.CNOC_I_SERVER, name: e.CNOC_I_NAME, projects, resources, update: e.CNOC_I_UPDATE }, null, 2) + "\n");
+        writeFileSync(e.CNOC_I_OUT, JSON.stringify({ server: e.CNOC_I_SERVER, name: e.CNOC_I_NAME, projects, resources }, null, 2) + "\n");
       '
     say "wrote $CONFIG"
   else
     name=$("$bun" -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).name ?? "")' "$CONFIG")
+    # Older installers wrote an "update" command that pulls a branch; the client now updates itself
+    # to the server's exact commit and ignores that command, so it is removed to avoid confusion.
+    # The pattern is the client's own, so the two cannot disagree about what is old.
+    "$bun" -e '
+      const fs = require("node:fs");
+      const [f, app] = process.argv.slice(1);
+      const { LEGACY_UPDATE } = require(app + "/src/client/update.ts");
+      const cfg = JSON.parse(fs.readFileSync(f, "utf8"));
+      if (LEGACY_UPDATE.test(cfg.update ?? "")) {
+        delete cfg.update;
+        fs.writeFileSync(f, JSON.stringify(cfg, null, 2) + "\n");
+        console.log("==> removed the old update command from " + f);
+      }
+    ' "$CONFIG" "$APP"
     say "kept $CONFIG"
   fi
 

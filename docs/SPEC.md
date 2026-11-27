@@ -211,7 +211,7 @@ One WebSocket per host, JSON messages, opened by the client at `/v1/client`.
 | Direction | Message | Meaning |
 |---|---|---|
 | server → client | `challenge` | A nonce, the server's version and protocol number. |
-| client → server | `hello` | Host name, public key, signature over the nonce. |
+| client → server | `hello` | Host name, public key, signature over the nonce, its version. On another version, an `update` note saying what it is doing about it. |
 | server → client | `pending` | The key is not approved yet. The connection closes. |
 | server → client | `welcome` | Accepted. Carries a short-lived API token and the heartbeat interval. |
 | client → server | `sync` | The full view: capacity, features, running attempts, finished-but-unacknowledged attempts. |
@@ -226,9 +226,14 @@ One WebSocket per host, JSON messages, opened by the client at `/v1/client`.
 
 ### 8.1 Versions and updates
 
-- The `challenge` states the server's version. A client on a different version sends nothing further.
-- It runs its configured `update` command with `CNOC_TARGET_VERSION` set, then exits with status 75 so its service manager starts the new code.
+- **The version is the code.** A process running from a git checkout reports the commit it was started from, resolved once at start (`src/version.ts`). Tracked files that differ from it add `-dirty`; untracked files do not count. Without a checkout, or when git fails, it reports the constant `VERSION` in `src/protocol.ts`. `CNOC_VERSION` overrides all of this. The git calls are read-only, name the directory safe for that call (so a service user can read another user's clone), and have a time limit. The session-side commands (`cnoc done` and the like) never resolve it.
+- A server or client whose version is the fallback or ends in `-dirty` logs a `WARNING` line at start saying why, because either strands every other host.
+- The `challenge` states the server's version. A client on a different version still sends a signed `hello` carrying its version and an `update` note; the server enrolls an unknown key as usual and closes. No work is sent. For an approved key only, it records the version (if it is a commit or a plain version string, else `(invalid)`) and the note with control characters removed and its length bounded, for `cnoc hosts`; the CLI strips control characters again. The record goes when the host connects on the right version, when its key is not approved, or when the server restarts.
+- The client then brings its own checkout to exactly that commit: `git fetch origin`, and if that does not bring it, `git fetch origin COMMIT`; `git checkout --detach COMMIT`; `bun install --frozen-lockfile`. It exits with status 75 so its service manager starts the new code. If a step after the checkout fails, it checks the previous commit (or branch) out again and reinstalls its dependencies, so a host is never left on new code with old dependencies. It refuses a version that is not a full commit name (a `-dirty` server, a non-checkout fallback) a commit name of the other hash kind, and a clone with uncommitted changes (the log line says how to discard them, for a checkout an interrupted update left behind).
+- The config's `update` field, if set, replaces that procedure with a shell command run with `CNOC_TARGET_VERSION` set. If the client runs from a git checkout, the result is checked: a command that succeeds but leaves the checkout short of the target counts as a failure. The command an older installer wrote there, or the example config showed (`git pull` of a branch), is recognised by one pattern, `LEGACY_UPDATE`, that the client and `install.sh` share; the client ignores it and the installer removes it.
+- **Backoff.** Each try for one target is recorded in the state directory (`update.json`), so it survives the exit. After a try that failed, or did not end in a restart, the next waits 1 minute, doubling to at most 30. A client exits only when that can help: its checkout moved, or the code was already in place and it has not yet restarted for this target. Meanwhile it asks the server at most every 5 minutes whether the version changed; a new target is tried at once. However many targets there are, at most 5 tries in an hour end in a restart, so a server whose version flaps cannot make a host thrash. The wait is capped at 30 minutes even if the clock jumps back. If the disk refuses the record, it is kept in memory and the failure logged once. Agreement clears the record, except the restart history.
 - Running sessions are unaffected and are re-adopted on restart.
+- **Trust.** The server chooses which commit of the client clone's own `origin` the client runs, and nothing more: the commit is validated as a hex object name and passed to git as an argument, never through a shell, and the remote is the one the clone already has. A compromised server can roll a host to any commit of that repository, old ones included.
 
 ### 8.2 Reconciliation
 
@@ -280,7 +285,7 @@ Bearer token on every call except health. The admin token may do everything. A h
 | `GET /v1/template?ref=` | One template with its text. `ref` is a number, a name or a source path. |
 | `DELETE /v1/template?ref=` | Admin. Remove. Jobs it started are unaffected. |
 | `POST /v1/template/run?ref=` | Start a job: `{ "set"?: { NAME: value }, "overrides"?, "key"?: string, "keyed"?: boolean }`. A `key` of null is the same as none. `keyed: true` refuses (400) a run that has no key from the request or the template; a key whose id belongs to a job the template did not start is refused with 409. Answers `{ job, template, created, state, seq }`; `created` is false when a keyed run's job already existed, and `state` is the job's state. |
-| `GET /v1/hosts` | Hosts with capacity, reserved counts, load and running attempts. |
+| `GET /v1/hosts` | The server's `version`, and hosts with capacity, reserved counts, load, running attempts, the version each last connected with, and `mismatch` (version, note, time) for a host last refused for its version. |
 | `POST /v1/host/approve?name=` | Admin. Approve a pending key. |
 | `POST /v1/host/drain?name=&on=1\|0` | Admin. Stop or resume placing work on a host. |
 | `GET /v1/state` | Snapshot of jobs, hosts and pools, with `as_of`. |
