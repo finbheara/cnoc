@@ -8,6 +8,27 @@ Cnoc does not plan work, review it or decide when it is done. A job is a prompt;
 
 **Status:** early. The core loop is built and tested end to end, including a real Claude Code session. See [docs/PLAN.md](docs/PLAN.md) for what is and is not built, and [docs/SPEC.md](docs/SPEC.md) for the design.
 
+## Install a client
+
+On each host that will run jobs. Needs [Bun](https://bun.sh), tmux and git.
+
+```
+curl -fsSL https://raw.githubusercontent.com/finbheara/cnoc/main/install.sh | bash -s -- \
+  --server http://controller.example:7878 \
+  --project myapp=~/github/myapp
+```
+
+Then approve the host once, from wherever you administer the server: `cnoc hosts approve NAME`.
+
+The installer clones Cnoc to `~/.local/share/cnoc/app`, puts a `cnoc` command in `~/.local/bin`, writes `~/.config/cnoc/client.json` and starts the client as a user service: systemd on Linux, launchd on macOS.
+
+- Repeat `--project NAME=PATH` for each checkout. `--resource gpu=1` offers a resource (default `slots=1`), and `--name` overrides the hostname.
+- Running it again updates the code and restarts the client. Running sessions are not interrupted, and the existing config is kept unless you pass `--force`.
+- The service does not read your shell profile. It gets the `PATH` the installer saw; on Linux, put any other variables in `~/.config/cnoc/client.env`.
+- `--uninstall` removes the service and the code, and keeps the config and host key.
+
+There is no installer for the server yet; see [Quick start](#quick-start).
+
 ## How it fits together
 
 ```
@@ -101,28 +122,23 @@ Adding a harness is adding a file. Put your own in a directory and point `harnes
 
 ## Quick start
 
-Requires [Bun](https://bun.sh) and tmux. Developed and tested on Bun 1.4.5 and tmux 3.7; older versions are untried.
-
-The commands below use `cnoc` for `bun /path/to/cnoc/src/cli.ts`; an alias is the simplest way to get that until there is a published package.
+Requires [Bun](https://bun.sh) and tmux. Tested on macOS and Linux (including WSL2), Bun 1.4.4 and 1.4.5, tmux 3.4 and 3.7; older versions are untried.
 
 **Server**, on a machine the hosts can reach:
 
 ```
-cnoc server --host 0.0.0.0
+git clone https://github.com/finbheara/cnoc && cd cnoc && bun install
+bun src/cli.ts server --host 0.0.0.0
 ```
 
-It prints where it wrote the admin token. Put TLS in front of it, or keep it on a private network; the server speaks plain HTTP.
+It prints where it wrote the admin token. Put TLS in front of it, or keep it on a private network; the server speaks plain HTTP. Keeping it running is up to you for now.
 
-**Each host**, with a config like [examples/client.json](examples/client.json):
+**Each host:** run the [installer](#install-a-client). The client generates a key on first start and waits to be approved. The config it writes looks like [examples/client.json](examples/client.json).
 
-```
-cnoc client --config ~/.config/cnoc/client.json
-```
-
-The client generates a key on first start and waits. Approve it once on the server side:
+**Anywhere you administer from**, the `cnoc` command needs the server's address and admin token, either in the environment or in `~/.config/cnoc/cli.json` as `{ "url", "token" }`. Without the installer, `cnoc` is `bun /path/to/cnoc/src/cli.ts`.
 
 ```
-export CNOC_URL=http://controller.example:7878 CNOC_TOKEN=$(cat ~/.local/share/cnoc/admin.token)
+export CNOC_URL=http://controller.example:7878 CNOC_TOKEN=...
 cnoc hosts
 cnoc hosts approve workbox
 ```
