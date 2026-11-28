@@ -25,10 +25,12 @@
  * `stop, run` is not filler, so (b) fails, and the sentence opens with `If`.
  *
  * WHAT IT DOES NOT COVER: `process.kill(pid, "SIGKILL")` and `kill(["-9", pid])` built from
- * arrays. The deadline escalation in `scripts/_runner/process-tree.ts` is the one owner of SIGKILL.
+ * arrays. This file names the commands in its own comments and patterns, so the rule skips itself.
  */
 
-import type { CheckRule } from "./_engine/rule";
+import type { Rule } from "am-i-done";
+
+const OWNER = "scripts/rules/no-process-kill.rule.ts";
 
 const TERM_RE = /\bpkill\b|\bkillall\b|\bkill\s+(?:-(?:9|KILL|SIGKILL)\b|-s\s+(?:KILL|SIGKILL|9)\b)/g;
 
@@ -87,32 +89,38 @@ export function isWarning(content: string, at: number, len: number): boolean {
   return PREDICATE_RE.test(tail);
 }
 
-const rule: CheckRule = {
+export default {
   id: "no-process-kill",
-  kind: "check",
+  type: "check",
+  category: "conventions",
+  files: [
+    "**/*.{ts,tsx,sh}",
+    ".git-hooks/pre-commit",
+    ".git-hooks/pre-push",
+    ".claude/**/*.md",
+    "docs/**/*.md",
+    "CLAUDE.md",
+    "README.md",
+  ],
   scold: "pkill / killall / kill -9: host-wide or handler-skipping process kills",
   guidance: [
     "stop only a pid you own, by pid, with SIGTERM: `kill <pid>` (the pid from your own spawn or pidfile)",
     "a wait on a process runs from a script file that polls `kill -0 <pid>`, not an inline `pgrep -f` loop",
     "a process that needs SIGKILL is a teardown bug: fix its signal handler",
     "text that WARNS is fine when the sentence opens with Never / Do not, or `never`/`no` directly governs the command",
-    "a genuine exception: // dotw-ignore no-process-kill: <why> (in markdown: <!-- // dotw-ignore no-process-kill: why -->)",
+    "a genuine exception: // doing-it-wrong-ignore no-process-kill: <why> (#issue) (in markdown, inside <!-- -->)",
   ],
-  appliesToFile: (rel) =>
-    !rel.startsWith(".claude/worktrees/") &&
-    (isCodeLike(rel) || /^(?:\.claude|docs)\/.+\.md$/.test(rel) || rel === "CLAUDE.md" || rel === "README.md"),
-  check({ file, violated, checked }) {
-    checked();
-    const { content, relPath } = file;
-    const code = isCodeLike(relPath);
+  check(ctx) {
+    const { content, relativePath } = ctx.file;
+    if (relativePath === OWNER || relativePath.startsWith(".claude/worktrees/")) return ctx.skipped();
+    const code = isCodeLike(relativePath);
+    const lines = content.split("\n");
     for (const m of content.matchAll(TERM_RE)) {
       const at = m.index ?? 0;
-      if ((!code || inComment(content, at, relPath)) && isWarning(content, at, m[0].length)) continue;
+      if ((!code || inComment(content, at, relativePath)) && isWarning(content, at, m[0].length)) continue;
       const line = content.slice(0, at).split("\n").length;
-      const lineText = content.split("\n")[line - 1] ?? "";
-      violated(line, 1, lineText.trim().slice(0, 160));
+      ctx.violated(line, 1, (lines[line - 1] ?? "").trim().slice(0, 160));
     }
+    return ctx.checked();
   },
-};
-
-export default rule;
+} satisfies Rule;

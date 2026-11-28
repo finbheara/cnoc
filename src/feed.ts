@@ -230,7 +230,9 @@ async function call<T>(deps: FeedDeps, f: (signal: AbortSignal) => Promise<T>): 
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
   });
-  aborted.catch(() => {});
+  aborted.catch(() => {
+    /* observed through the race below; this only keeps the rejection from going unhandled */
+  });
   try {
     return await Promise.race([f(signal), aborted]);
   } catch (e) {

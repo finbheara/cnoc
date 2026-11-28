@@ -8,16 +8,17 @@ the design and its reasons, `docs/PLAN.md` for what is and is not built.
 
 `bun am-i-done` is the one definition of done. Run it before saying work is finished.
 
-- `bun am-i-done`: everything. Install, typecheck, lint (with fixes), the rules, the example
-  Jobfiles, shellcheck, the whole test suite.
+- `bun am-i-done`: everything. Install, the Bun version, typecheck, lint (with fixes), the rules,
+  the example Jobfiles, shellcheck, the whole test suite. It is the `am-i-done` package, set up
+  in `done.toml`; this repo's stages are `scripts/stages/*.stage.ts`.
 - `bun am-i-done --pre-commit` / `--pre-push`: what the git hooks run (`.git-hooks/`, installed by
   `bun install`). Never bypass them with `--no-verify`.
-- `bun am-i-done --ci`: the same list as `--pre-push`. CI runs it on Linux and macOS for every
-  pull request (`.github/workflows/ci.yml`), and both jobs must pass before a merge to `main`.
-- `--only NAME`, `--from NAME`, `--skip NAME` to iterate on one step.
+- `--ci` (implied when `CI` is set): the same list as `--pre-push`. CI runs it on Linux and macOS
+  for every pull request (`.github/workflows/ci.yml`), and both jobs must pass before a merge to `main`.
+- `--only NAME`, `--from NAME` to iterate on one stage; `--list` shows the plan.
 - `bun doing-it-wrong --list`: the rules. Each prints its own fix; read it instead of guessing.
   How to write or suppress one: `scripts/rules/README.md`.
-- In an agent session the output goes to `build/am-i-done-<time>.txt` and only the path is shown
+- In an agent session the output goes to `.am-i-done/run-*.log` and only the path is shown
   on failure. Read that file; do not rerun with `--verbose` to see it.
 
 ## Layout
@@ -29,7 +30,7 @@ the design and its reasons, `docs/PLAN.md` for what is and is not built.
   attempt), `tmux.ts`.
 - `test/`: unit tests per module and `e2e.test.ts`, which runs a real server, real clients and
   real tmux sessions.
-- `scripts/`: the gate. `harness/`: adapter files. `examples/`: Jobfiles and a template.
+- `scripts/`: the gate's own stages and rules, and `testkit/`. `harness/`: adapter files. `examples/`: Jobfiles and a template.
 
 ## Tests
 

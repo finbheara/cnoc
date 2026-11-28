@@ -1,3 +1,4 @@
+// doing-it-wrong-ignore-file no-raw-temp: this repository's own temp owner, which removes what it makes (#10)
 /**
  * THE ONE WAY A SPEC MAKES A THROWAWAY DIRECTORY.
  *
@@ -20,8 +21,9 @@
  * returning AND the throwing path. `using` does not run on a signal; the pid reaper does
  * the rest.
  *
- * `no-raw-mkdtemp` (scripts/rules) refuses a raw `mkdtemp` / `tmpdir()` anywhere but here
- * and the non-spec owner, `./scratch.ts` (`scratchDir`).
+ * The built-in `no-raw-temp` and the repo rule `no-tmpdir-env` refuse a raw `mkdtemp` / `tmpdir()` /
+ * `$TMPDIR` anywhere but here and the non-spec owner, `./scratch.ts` (`scratchDir`): both owners
+ * carry a file waiver (#10).
  */
 
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";

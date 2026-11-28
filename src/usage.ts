@@ -91,14 +91,15 @@ export async function* lines(
       }
     }
   } finally {
-    await reader.cancel().catch(() => undefined);
+    await reader.cancel().catch(() => /* the stream already ended or failed: nothing to release */ undefined);
   }
 }
 
 const SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 /** True for a regular file. A FIFO, a device or a directory named `*.jsonl` is not a transcript. */
-const isFile = async (p: string): Promise<boolean> => (await stat(p).catch(() => null))?.isFile() ?? false;
+const isFile = async (p: string): Promise<boolean> =>
+  (await stat(p).catch(() => /* cannot stat: not a transcript */ null))?.isFile() ?? false;
 
 /** Every `*.jsonl` file under a directory, depth first, not following symbolic links. */
 async function jsonlUnder(dir: string, depth = 0): Promise<string[]> {

@@ -1,0 +1,3 @@
+// @path scripts/testkit/scratch.ts
+// The non-spec owner may read it: it is the thing that removes what it makes.
+export const base = process.env.TMPDIR ?? "";

@@ -1,58 +1,61 @@
+import { type Rule, type TSESTree, walk } from "am-i-done";
+
 /**
- * Rule: no-per-test-timeout
+ * Bun's third argument to `test()` and `it()` is an options slot: a number or `{ timeout }`, or
+ * `{ retry }` / `{ repeats }`. A longer limit on one test lets it grow slow without anyone being
+ * told, and the suite's time creeps up one exception at a time. A retry turns a flaky test green
+ * on its second try, and the bug that made it flaky ships. Make the test fast and deterministic;
+ * if a whole file truly needs longer, set that once for the file and say what is slow.
  *
- * A test call (`test`, `it`, and their `.only` / `.skip` / `.if(c)` / `.each(t)` forms) with a
- * THIRD argument: a per-test `{ timeout }` / number, or `{ retry }` / `{ repeats }`. Bun's third
- * positional is exactly that options slot, so any third argument is one of them.
- *
- * WHY. A per-test timeout hides one slow test inside a fast file: the file as a whole looks
- * fine and nothing ever names the slow test. A per-test `retry` is a flake absorbed by
- * construction. When a file genuinely needs longer, say so once at file scope with
- * `setDefaultTimeout(NAMED_MS)` and a comment giving the reason.
- *
- * AST-based: only a call whose callee chain bottoms out in the identifier `test` or `it` counts;
- * `describe`, hooks and unrelated three-argument calls are not flagged.
+ * Owns the third argument of a test registration and nothing inside the test body; waits and
+ * delays in a body belong to `test-timeouts`, so the two never report the same code. Modifier
+ * chains count (`test.only`, `test.skip.each(rows)(name, fn, 5_000)`, `test.skipIf(c)(...)`);
+ * `describe`, hooks and the modifier calls themselves (`test.each(a, b, c)`) do not.
  */
+const TEST_FUNCTIONS: ReadonlySet<string> = new Set(["test", "it"]);
 
-import ts from "typescript-5";
-import type { CheckRule } from "./_engine/rule";
+/** Modifiers that take arguments of their own, so a call to one is not a test registration. */
+const MODIFIERS: ReadonlySet<string> = new Set(["each", "if", "skipIf", "todoIf", "failing"]);
 
-const TEST_FNS: ReadonlySet<string> = new Set(["test", "it"]);
-
-/** The identifier a callee chain starts from: `test.skip.each(t)` -> `test`. */
-function rootIdentifier(expr: ts.Expression): string | null {
-  let cur: ts.Expression = expr;
+/** The identifier a callee chain starts from: `test.skip.each(rows)` gives `test`. */
+const rootName = (node: TSESTree.Node): string | undefined => {
+  let current = node;
   for (;;) {
-    if (ts.isIdentifier(cur)) return cur.text;
-    if (ts.isPropertyAccessExpression(cur)) cur = cur.expression;
-    else if (ts.isCallExpression(cur)) cur = cur.expression;
-    else return null;
+    if (current.type === "Identifier") return current.name;
+    if (current.type === "MemberExpression") current = current.object;
+    else if (current.type === "CallExpression") current = current.callee;
+    else return undefined;
   }
-}
-
-const rule: CheckRule = {
-  id: "no-per-test-timeout",
-  kind: "check",
-  appliesToTests: true,
-  scold: "a per-test timeout / retry (third argument to test/it): it hides a slow or flaky test",
-  guidance: [
-    "Bad:   test('x', async () => { ... }, 30_000)        Bad: test('x', fn, { retry: 3 })",
-    "Good:  at file scope, `setDefaultTimeout(X_SPEC_TIMEOUT_MS)` with a comment saying what is slow and why",
-    "better: make the test fast (extract pure logic, split the file, poll a condition)",
-    "a retry is never the fix: a test that is green only on a rerun is a flake; find its cause",
-  ],
-  check({ file, violated, ast, checked }) {
-    checked();
-    const lines = file.content.split("\n");
-    for (const call of ast.find(ts.isCallExpression)) {
-      if (call.arguments.length < 3) continue;
-      const root = rootIdentifier(call.expression);
-      if (root === null || !TEST_FNS.has(root)) continue;
-      const third = call.arguments[2] as ts.Expression;
-      const pos = ast.positionOf(third);
-      violated(pos.line, pos.column, (lines[pos.line - 1] ?? "").trim());
-    }
-  },
 };
 
-export default rule;
+const isModifierCall = (callee: TSESTree.Node): boolean =>
+  callee.type === "MemberExpression" &&
+  !callee.computed &&
+  callee.property.type === "Identifier" &&
+  MODIFIERS.has(callee.property.name);
+
+export default {
+  id: "no-per-test-timeout",
+  type: "check",
+  category: "testing",
+  ast: true,
+  tests: "only",
+  scold: "A test registered with its own timeout or retry, which lets it be slow or flaky unnoticed.",
+  guidance: [
+    "Make the test fast: extract the pure logic, split the file, or wait on a condition instead of a delay.",
+    "If the whole file needs longer, call `setDefaultTimeout(...)` once at file scope with a comment giving the reason.",
+    "Never retry: find out why the test fails on the first run.",
+  ],
+  check(ctx) {
+    const lines = ctx.file.content.split("\n");
+    walk(ctx.ast().program, (node) => {
+      if (node.type !== "CallExpression" || isModifierCall(node.callee)) return;
+      const third = node.arguments[2];
+      const root = rootName(node.callee);
+      if (third === undefined || root === undefined || !TEST_FUNCTIONS.has(root)) return;
+      const { line, column } = third.loc.start;
+      ctx.violated(line, column + 1, (lines[line - 1] ?? "").trim());
+    });
+    return ctx.checked();
+  },
+} satisfies Rule;

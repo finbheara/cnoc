@@ -1,0 +1,5 @@
+# @expect 0
+# @path scripts/example.sh
+#!/usr/bin/env bash
+# // doing-it-wrong-ignore no-process-kill: a reasoned, reviewed exception (#10)
+pkill -x example-only-this-name

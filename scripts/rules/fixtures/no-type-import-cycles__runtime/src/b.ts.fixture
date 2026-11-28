@@ -1,0 +1,3 @@
+// @expect 0
+import { a } from "./a";
+export const b = (): number => (a.length > 9 ? 0 : 1);

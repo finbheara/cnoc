@@ -20,7 +20,7 @@ Tested means covered by `bun test`: 200 tests of cnoc itself (the count `bun tes
 | Templates | `ARG` and `--set`, saved on the server, each run a numbered job; add, list, show, run, remove. Keyed runs (`--key`, or `key:` in the template) start once however often they are offered; `keyed` refuses a run with no key. |
 | Feeding | `cnoc feed`: keyed template runs from a command's JSON lines, once or on an interval, with a per-pass cap, limits on the command's time and output, a check that the server does keyed runs, exit 78 for what a restart cannot fix, `--dry-run`, and a GitHub issues source in `examples/`. |
 | When and where | `begin` (a time or a delay), `--on HOST` through a `host/NAME` feature, priority at submit and on a waiting job. |
-| Gate | `bun am-i-done`: one ordered list of checks with a deadline, modes for the git hooks, and output kept out of an agent's context. `bun doing-it-wrong`: a rule engine with fifteen rules, each with fixtures. CI runs the gate on Linux and macOS, and both jobs are required on `main`. |
+| Gate | `bun am-i-done`: one ordered list of checks with a deadline, modes for the git hooks, and output kept out of an agent's context. `bun doing-it-wrong`: the rule engine, with the package's built-in rules and this repository's own, each with fixtures. Both come from the `am-i-done` package. CI runs the gate on Linux and macOS, and both jobs are required on `main`. |
 | Client install | `install.sh`: clone, `cnoc` command, config, and a systemd user unit or launchd agent that leaves tmux sessions alone on restart. |
 
 Checked by hand, not by the test suite:
@@ -86,7 +86,7 @@ In rough order of value.
 Brought across without these parts of the gate it was taken from:
 
 - **Coverage ratchet**, per-file spec accounting and per-file timing. `--ci` is the same list as `--pre-push` until they exist.
-- **Stale-todo check.** A `dotw-todo` must name an issue, but nothing fails when that issue is closed.
+- **Stale-todo check.** A suppression must cite an issue, but nothing fails when that issue is closed.
 - **Dead-module check.**
 - **File size.** The cap is 750 lines because five files were over 400 when the rule landed. Splitting them and lowering the cap is open.
 

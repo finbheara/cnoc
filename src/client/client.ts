@@ -496,7 +496,7 @@ export class CnocClient {
       return Response.json({ ok: true, delivered: this.connected });
     }
     if (url.pathname === "/attempt/result" && req.method === "POST") {
-      const body = await req.json().catch(() => null);
+      const body = await req.json().catch(() => /* not JSON: refused as malformed below */ null);
       const late = wrongStage(body, runner.state.stage + 1);
       if (late) return Response.json({ error: late }, { status: 409 });
       const result = readResult(body);
@@ -504,7 +504,9 @@ export class CnocClient {
       return Response.json({ ok: true, accepted: runner.report(result) });
     }
     if (url.pathname === "/attempt/usage" && req.method === "POST") {
-      const body = (await req.json().catch(() => null)) as { usage?: unknown } | null;
+      const body = (await req.json().catch(() => /* not JSON: refused as malformed below */ null)) as {
+        usage?: unknown;
+      } | null;
       if (!body || typeof body !== "object") return Response.json({ error: "expected { usage }" }, { status: 400 });
       const late = wrongStage(body, runner.state.stage + 1);
       const usage = late ? undefined : cleanUsage(body.usage);

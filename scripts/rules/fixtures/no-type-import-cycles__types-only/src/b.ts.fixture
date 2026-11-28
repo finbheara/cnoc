@@ -1,0 +1,4 @@
+// @expect 1
+import type { Job } from "./a";
+// import { job } from "./a"; (a comment is not an edge)
+export const make = (): Job => ({ id: "x" });

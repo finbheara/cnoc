@@ -1,0 +1,23 @@
+# am-i-done: this project's definition of done. Keys left out take the package defaults.
+# Reference: https://github.com/theshadow27/am-i-done#configuration
+
+[run]
+deadline_seconds = 600    # the whole run; the old gate's ceiling, kept
+timeout_seconds = 300     # each stage, unless it sets timeoutMs
+rerun = "diagnose"        # a failure is run again to see if it repeats, and fails either way ("off", "pass")
+
+[stages]
+recommended = true        # bun-version, typecheck, lint, rules, test: each where its tool is set up
+dirs = ["scripts/stages"] # this project's *.stage.ts
+# skip = [{ id = "lint", reason = "<why>, until #123" }]
+
+[rules]
+recommended = true        # the built-in rules (doing-it-wrong --list)
+dirs = ["scripts/rules"]  # this project's *.rule.ts, with fixtures in scripts/rules/fixtures/
+# skip = [{ id = "no-as-any", reason = "<why>, until #123" }]
+
+[suppression]
+require_issue = true      # every waiver cites an issue: // doing-it-wrong-ignore <rule>: <reason> (#123)
+
+[cache]
+skip = true               # a local rerun of an unchanged tree is skipped; never in CI

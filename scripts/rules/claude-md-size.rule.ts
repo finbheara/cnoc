@@ -1,32 +1,28 @@
+import type { Rule } from "am-i-done";
+import { MAX_CLAUDE_MD_BYTES as MAX_BYTES } from "./_config/limits";
+
 /**
- * Rule: claude-md-size
- *
- * A CLAUDE.md over MAX_CLAUDE_MD_BYTES (scripts/rules/_config/limits.ts) fails. An
- * uncapped CLAUDE.md only grows, and every agent pays for every byte on every turn.
- * Anchored on the root CLAUDE.md, so deleting or renaming it is an engine error, not a pass.
- *
- * WHAT IT DOES NOT COVER: a CLAUDE.md the loader does not walk (it walks the root, `.claude/**`
- * and `docs/**`), and whatever CLAUDE.md imports or links to.
+ * Every CLAUDE.md an agent works under is loaded into every turn, so each byte is paid for on every
+ * request, and a long one buries the rules that matter under the ones that don't. A cap makes
+ * growth a decision. The anchor makes the rule fail, not pass, once the root CLAUDE.md is gone.
+ * The cap is in `_config/limits.ts`; raising it is the owner's decision.
  */
-import { MAX_CLAUDE_MD_BYTES } from "./_config/limits";
-import type { CheckRule } from "./_engine/rule";
-
-const rule: CheckRule = {
+export default {
   id: "claude-md-size",
-  kind: "check",
-  scold: `CLAUDE.md over ${MAX_CLAUDE_MD_BYTES} bytes: it is loaded into every agent's context`,
+  type: "check",
+  category: "conventions",
+  files: ["CLAUDE.md", "**/CLAUDE.md"],
+  scold: `A CLAUDE.md over ${MAX_BYTES} bytes, which every agent turn pays for.`,
   guidance: [
-    "cut, do not compress: a statement that a check enforces does not need to be in CLAUDE.md as well",
-    "move reference material to the file it describes, and leave a one-line pointer",
-    `the cap lives in scripts/rules/_config/limits.ts (MAX_CLAUDE_MD_BYTES); raising it is the owner's decision`,
+    "Keep what an agent needs on every task: what done means, the layout, the conventions.",
+    "Move the rest to docs the CLAUDE.md links to, which an agent reads when the task needs them.",
+    "Delete what the code, the config or a rule already enforces.",
+    "The cap lives in scripts/rules/_config/limits.ts (MAX_CLAUDE_MD_BYTES); raising it is the owner's decision.",
   ],
-  anchors: ["CLAUDE.md"],
-  appliesToFile: (rel) => rel === "CLAUDE.md" || rel.endsWith("/CLAUDE.md"),
-  check({ file, violated, checked }) {
-    checked();
-    const bytes = Buffer.byteLength(file.content, "utf8");
-    if (bytes > MAX_CLAUDE_MD_BYTES) violated(1, 1, `${file.relPath}: ${bytes} bytes (cap ${MAX_CLAUDE_MD_BYTES})`);
+  anchors: [(files) => files.has("CLAUDE.md")],
+  check(ctx) {
+    const bytes = Buffer.byteLength(ctx.file.content);
+    if (bytes > MAX_BYTES) ctx.violated(1, 1, `${bytes} bytes, over the ${MAX_BYTES}-byte cap`);
+    return ctx.checked();
   },
-};
-
-export default rule;
+} satisfies Rule;

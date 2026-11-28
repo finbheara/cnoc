@@ -1,0 +1,4 @@
+// @expect 0
+// A cycle that runs is the built-in no-import-cycles' to report, not this rule's.
+import { b } from "./b";
+export const a = (): number => b() + 1;
