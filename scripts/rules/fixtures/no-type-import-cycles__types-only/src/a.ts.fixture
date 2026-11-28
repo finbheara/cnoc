@@ -1,0 +1,5 @@
+// @expect 1
+// A cycle that closes only through a type import: a.ts imports b.ts at run time, b.ts imports a type back.
+import { make } from "./b";
+export interface Job { id: string }
+export const job = (): Job => make();

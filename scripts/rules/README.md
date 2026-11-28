@@ -1,32 +1,34 @@
 # Rules
 
-`bun doing-it-wrong` checks the repository against the rules in this directory. It runs as a step
-of `bun am-i-done`, so a violation fails the gate.
+`bun doing-it-wrong` checks the repository against the rules of the
+[am-i-done](https://github.com/theshadow27/am-i-done#rules) package: its built-in rules plus every
+`*.rule.ts` in this directory. It runs as the `rules` stage of `bun am-i-done`, so a violation
+fails the gate.
 
 ```
 bun doing-it-wrong              # every rule, every file
-bun doing-it-wrong --list       # the catalog, one line per rule
+bun doing-it-wrong --list       # the catalog, by category
 bun doing-it-wrong --rule ID    # one rule
-bun doing-it-wrong --filter src/server   # files whose path contains this
-bun doing-it-wrong --all        # every violation, no per-rule cap
+bun doing-it-wrong src/server   # only these paths
 ```
 
 A violation prints what is wrong and how to fix it. Read that before looking anything up here.
 
 ## What a rule is
 
-One file, `<id>.rule.ts`, with a default export. Any file with that suffix in this directory is
-loaded; there is no list to add it to.
+One file, `<id>.rule.ts`, that default-exports a `Rule` from `am-i-done`. Any file with that
+suffix in this directory is loaded; there is no list to add it to.
 
-- A `pattern` rule is a regular expression run over each line.
-- A `check` rule is a function that gets the file, every other loaded file and a lazily parsed
-  TypeScript AST. It calls `violated(line, column, snippet)` for each finding and `checked()` when
-  it has done real inspection, so a rule that silently matches nothing shows up.
+- A `pattern` rule is a global regular expression over each file's code (not its comments or
+  strings, unless it sets `scope`).
+- A `check` rule is a function that gets the file, every other loaded file, the file's syntax tree
+  (`ast: true`, then `ctx.ast()`) and the import graph. It calls `ctx.violated(line, column,
+  snippet)` for each finding and returns `ctx.checked()` or `ctx.skipped()`, so a rule that
+  inspects nothing on the real tree fails instead of passing.
 
 Every rule has a `scold` (one line: what is wrong) and `guidance` (how to fix it). By default a
-rule sees TypeScript under `src/`, `scripts/` and `test/`. `appliesToTests` narrows it to test
-files or to everything else; `appliesToFile` lets it see the markdown, shell scripts and hooks
-the loader also reads.
+rule sees every script file git does not ignore; `files` widens or narrows that (markdown, shell,
+the hooks) and `tests: "only"` / `"exclude"` scopes it by spec files.
 
 ## A rule lands at zero violations
 
@@ -35,30 +37,28 @@ exemptions teaches everyone to add to the list.
 
 ## Fixtures
 
-`fixtures/<id>__<scenario>.fixture.ts` is a small file with a header saying which rule it is for,
-how many violations to expect and the path the rule should believe it has:
+`fixtures/<id>__<scenario>.<ext>.fixture` is a small file the rule runs over on every run. A
+comment line of its own in its first lines says how many violations to expect and, if the scenario
+name is not the path, the path the rule should believe it has:
 
 ```ts
-/**
- * @rule no-as-any
- * @expect 1
- * @path src/example.ts
- */
+// @expect 1
+// @path src/example.ts
 ```
 
-`fixtures.spec.ts` runs every fixture against its rule. Give a rule at least one fixture that is
-flagged and one that is clean. Markdown and shell fixtures use `#fixture @rule ...` lines instead.
+Give a rule at least one fixture that fires and one that is clean. A rule that looks across files
+gets a scenario directory, `fixtures/<id>__<scenario>/`, holding a small project.
 
 ## Suppressing a finding
 
 ```ts
-// dotw-ignore <rule-id>: <why this case is correct>
-// dotw-todo <rule-id>: <what is wrong> - fix in #123
+// doing-it-wrong-ignore <rule-id>: <why this case is correct> (#123)
 ```
 
-The comment goes on the line or the line above. `dotw-ignore` is permanent and needs a reason a
-reviewer would accept. `dotw-todo` is temporary and must name a real issue number; the
-`dotw-todo-needs-issue` rule refuses one without.
+It applies to its own line and the two below, in any comment syntax (in markdown, inside
+`<!-- -->`). `doing-it-wrong-ignore-file <rule-id>: <why> (#123)` covers a whole file. Every
+suppression cites the issue that tracks it, and one that no longer suppresses anything is itself a
+violation.
 
 ## Limits
 

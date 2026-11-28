@@ -1,0 +1,4 @@
+<!-- @path packages/app/CLAUDE.md -->
+# app
+
+Run `bun test` in this package. See docs/app.md for the data model.

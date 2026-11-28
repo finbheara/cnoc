@@ -1,0 +1,9 @@
+// @expect 3
+// @path src/example.ts
+// Reads of the temp directory from the environment, outside the owners. A comment naming
+// process.env.TMPDIR is prose, and an env object that SETS TMPDIR for a child is not a read.
+const a = process.env.TMPDIR;
+const b = Bun.env.TMPDIR;
+const c = process.env["TMPDIR"];
+const env = { ...process.env, TMPDIR: "/x" };
+export { a, b, c, env };

@@ -1,0 +1,12 @@
+// @expect 8
+// @path src/a.spec.ts
+test("a", async () => {}, 30_000);
+it("b", () => {}, { timeout: 5_000 });
+test("c", () => {}, { retry: 3 });
+test.only("d", () => {}, { repeats: 2 });
+test.each(rows)("e", (row) => {}, 10_000);
+test.skip.each(rows)("f", (row) => {}, 10_000);
+test.skipIf(slow)("g", () => {}, 1);
+it.if(ci)("h", () => {}, {
+  timeout: 1,
+});

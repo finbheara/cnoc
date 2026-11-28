@@ -1,0 +1,11 @@
+// @expect 5
+// @path src/a.spec.ts
+test("a", async () => {
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  await Bun.sleep(100);
+  Bun.sleepSync(1_000);
+  setTimeout(() => done(), 50, "extra");
+  await new Promise((resolve) =>
+    setTimeout(resolve, 20),
+  );
+});

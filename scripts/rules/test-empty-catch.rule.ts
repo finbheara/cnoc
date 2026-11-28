@@ -1,53 +1,41 @@
 /**
  * Rule: test-empty-catch
  *
- * Flag catch blocks in test files whose body contains no `expect(` call.
- * An empty or assertion-free catch swallows the failure the test claims
- * to verify — the test passes vacuously when the code throws.
+ * Flag catch blocks in test files whose body contains no `expect(` call. An empty or
+ * assertion-free catch swallows the failure the test claims to verify: the test passes vacuously
+ * when the code throws.
  *
- * Uses AST CatchClause nodes for scope-correct
- * detection — avoids regex scope-blindness on same-line or nested catches.
- *
+ * Stricter than the package sample of the same idea: every catch in a spec file counts, hooks and
+ * helpers included, and a rethrow alone does not satisfy it.
  */
+import { type Rule, type TSESTree, walk } from "am-i-done";
 
-import ts from "typescript-5";
-import type { CheckRule } from "./_engine/rule";
-
-function containsExpectCall(node: ts.Node): boolean {
+function containsExpectCall(node: TSESTree.Node): boolean {
   let found = false;
-  function walk(n: ts.Node): void {
-    if (found) return;
-    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "expect") {
-      found = true;
-      return;
-    }
-    ts.forEachChild(n, walk);
-  }
-  walk(node);
+  walk(node, (n) => {
+    if (n.type === "CallExpression" && n.callee.type === "Identifier" && n.callee.name === "expect") found = true;
+  });
   return found;
 }
 
-const rule: CheckRule = {
+export default {
   id: "test-empty-catch",
-  kind: "check",
-  scold: "catch block in test has no expect() — swallows the failure the test should verify",
+  type: "check",
+  category: "testing",
+  ast: true,
+  tests: "only",
+  scold: "catch block in test has no expect(): swallows the failure the test should verify",
   guidance: [
     "assert the caught error: expect(e).toBeInstanceOf(SomeError) or expect((e as Error).message).toContain(...)",
     "or replace try/catch with expect(fn).toThrow(...)",
   ],
-  appliesToTests: true,
-  check({ file, violated, ast }) {
-    const sf = ast.sourceFile;
-    const catchClauses = ast.find(ts.isCatchClause);
-
-    for (const clause of catchClauses) {
-      if (!containsExpectCall(clause.block)) {
-        const pos = ast.positionOf(clause);
-        const line = file.content.split("\n")[pos.line - 1] ?? "";
-        violated(pos.line, pos.column, line.trim());
-      }
-    }
+  check(ctx) {
+    const lines = ctx.file.content.split("\n");
+    walk(ctx.ast().program, (node) => {
+      if (node.type !== "CatchClause" || containsExpectCall(node.body)) return;
+      const { line, column } = node.loc.start;
+      ctx.violated(line, column + 1, (lines[line - 1] ?? "").trim());
+    });
+    return ctx.checked();
   },
-};
-
-export default rule;
+} satisfies Rule;
