@@ -5,10 +5,12 @@
   "license": "MIT",
   "type": "module",
   "packageManager": "bun@1.4.5",
-  "bin": { "cnoc": "src/cli.ts" },
+  "bin": {
+    "cnoc": "src/cli.ts"
+  },
   "scripts": {
-    "am-i-done": "bun scripts/am-i-done.ts",
-    "doing-it-wrong": "bun scripts/doing-it-wrong.ts",
+    "am-i-done": "bun install --frozen-lockfile --silent && am-i-done",
+    "doing-it-wrong": "doing-it-wrong",
     "typecheck": "bun check",
     "lint": "bunx biome check --write .",
     "lint:check": "bunx biome check .",
@@ -18,7 +20,6 @@
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@types/bun": "latest",
-    "typescript-5": "npm:typescript@5.9.3",
-    "zod": "^4.3.6"
+    "am-i-done": "^0.4.2"
   }
 }
