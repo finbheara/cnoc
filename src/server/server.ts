@@ -422,7 +422,7 @@ export class CnocServer {
               },
               body,
               signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
-            }).catch(() => null);
+            }).catch(() => /* a network failure is a failed delivery: retried below */ null);
             // Delivery is in order and at least once: stop at the first failure and retry later.
             if (!res?.ok) break;
           }

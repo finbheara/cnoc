@@ -1,7 +1,8 @@
+// doing-it-wrong-ignore-file no-raw-temp: this repository's own temp owner, which removes what it makes (#10)
 /**
  * NON-SPEC SCRATCH: a directory a script or a long-lived process mints and must not strand.
- * It lives beside the spec helpers because the gate scripts are its only users today. When
- * production code needs scratch, move this file there and update the `no-raw-mkdtemp` owners.
+ * It lives beside the spec helpers. When production code needs scratch, move this file there and
+ * update the owners of `no-tmpdir-env` and the `no-raw-temp` waiver.
  *
  * WHERE. Every scratch directory of a process lands under ONE root named for it,
  * `<tmpdir>/cnoc-scratch-<pid>/<prefix>XXXXXX`, never loose in `$TMPDIR`.
@@ -21,8 +22,8 @@
  * own handlers must keep them, so this module installs none; the pid reaper covers the death
  * that does not unwind.
  *
- * The rule `no-raw-mkdtemp` (scripts/rules) allows the raw primitive only here and in
- * `./tmp.ts`.
+ * The rules `no-raw-temp` (built in, waived here, #10) and `no-tmpdir-env` (scripts/rules) allow
+ * the raw primitive only here and in `./tmp.ts`.
  */
 
 import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";

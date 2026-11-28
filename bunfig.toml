@@ -1,6 +1,6 @@
 [test]
 # The run cleans up after itself: reaps dead-pid temp roots at start, removes this run's at the end.
-# A test makes a throwaway directory only through scripts/testkit (rule no-raw-mkdtemp).
+# A test makes a throwaway directory only through scripts/testkit (rules no-raw-temp, no-tmpdir-env).
 preload = ["./scripts/testkit/preload.ts"]
 # Coverage counts only files in the repo, not the throwaway rule modules a spec writes to a temp directory.
 coveragePathIgnorePatterns = ["**/rule-loader-*/**"]

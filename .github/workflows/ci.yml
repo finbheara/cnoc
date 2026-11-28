@@ -1,4 +1,4 @@
-# Runs the same gate a person and the git hooks run: `bun am-i-done --ci`.
+# Runs the same gate a person and the git hooks run: `bun run am-i-done` (ci mode under CI).
 # Both jobs are required checks on main.
 name: ci
 
@@ -40,4 +40,4 @@ jobs:
             brew install tmux shellcheck
           fi
       - run: bun install --frozen-lockfile
-      - run: bun am-i-done --ci
+      - run: bun run am-i-done # CI is set, so this is the ci mode

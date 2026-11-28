@@ -236,7 +236,9 @@ async function main(): Promise<void> {
     case "version":
     case "--version": {
       console.log(`cnoc ${runningVersion()} (protocol ${PROTOCOL})`);
-      const s = await api<{ version: string; protocol: number }>("GET", "/v1/health").catch(() => null);
+      const s = await api<{ version: string; protocol: number }>("GET", "/v1/health").catch(
+        () => /* server unreachable: show the client only */ null,
+      );
       if (s) console.log(`server ${s.version} (protocol ${s.protocol})`);
       return;
     }

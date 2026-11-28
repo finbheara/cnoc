@@ -331,10 +331,10 @@ bun install          # also points git at the hooks in .git-hooks/
 bun am-i-done        # the one definition of done
 ```
 
-`bun am-i-done` runs every check in order and stops at the first that fails: install, typecheck, lint, the project rules, the example Jobfiles, shellcheck, then the whole test suite. It needs tmux and shellcheck on `PATH`.
+`bun am-i-done` installs, then runs every check: the Bun version, typecheck, lint, the project rules, the example Jobfiles, shellcheck, then the whole test suite. It needs tmux and shellcheck on `PATH`. The gate is the [am-i-done](https://github.com/theshadow27/am-i-done) package, configured in `done.toml`; this repository's own stages are in `scripts/stages/` and its rules in `scripts/rules/`.
 
 - `--pre-commit` runs the static checks and `--pre-push` adds the tests; the git hooks call these.
-- CI runs `bun am-i-done --ci` on Linux and macOS for every pull request, and both must pass to merge.
-- `--only NAME`, `--from NAME` and `--skip NAME` narrow a run while you iterate.
+- CI runs `bun am-i-done` (the `ci` mode, since `CI` is set) on Linux and macOS for every pull request, and both must pass to merge.
+- `--only NAME` and `--from NAME` narrow a run while you iterate; `--list` shows the plan.
 - `bun doing-it-wrong --list` shows the project rules. Each one prints how to fix what it finds; [scripts/rules/README.md](scripts/rules/README.md) explains how to write or suppress one.
-- Inside an agent session the output goes to `build/am-i-done-<time>.txt`, and only that path is printed on failure.
+- Inside an agent session the output goes to `.am-i-done/run-*.log`, and only that path is printed on failure.

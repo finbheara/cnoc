@@ -1,4 +1,4 @@
-// Spec helpers. The one way a spec makes a throwaway directory (rule no-raw-mkdtemp).
+// Spec helpers. The one way a spec makes a throwaway directory (rules no-raw-temp, no-tmpdir-env).
 export {
   SPEC_TMP_PREFIX,
   TmpDir,
